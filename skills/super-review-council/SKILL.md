@@ -1,6 +1,17 @@
 ---
 name: super-review-council
 description: "Use when the user explicitly asks for Super Review Council, super-review-council, 超级审查会, or a heavy multi-agent review council workflow; or when a loaded coordinator workflow explicitly invokes this skill as a bounded child review pass. Do not trigger for plain review, built-in codex review, Guardian auto_review, normal maintenance, commits, shipping, CI checks, old skill-name mentions, or mere path mentions."
+tags:
+  - coding
+  - code-review
+  - software-engineering
+  - multi-agent
+  - verification
+allowed-tools:
+  - read
+  - write
+  - exec
+license: MIT
 ---
 
 # Super Review Council / 超级审查会

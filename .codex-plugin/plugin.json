@@ -1,6 +1,6 @@
 {
   "name": "super-review-council",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Heavy multi-agent review council workflow for Codex.",
   "author": {
     "name": "molang163",
