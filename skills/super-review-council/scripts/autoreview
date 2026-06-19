@@ -1,0 +1,2805 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import atexit
+import concurrent.futures
+import copy
+import hashlib
+import json
+import os
+import queue
+import signal
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Any, Callable
+
+
+ENGINES = ("codex", "claude", "droid", "copilot")
+DEFAULT_ENGINE_TIMEOUT_SECONDS = 1800
+DEFAULT_PARALLEL_TESTS_TIMEOUT_SECONDS = 1800
+DEFAULT_BUNDLE_MAX_FILES = 1000
+DEFAULT_BUNDLE_MAX_TOTAL_BYTES = 20_000_000
+DEFAULT_BUNDLE_MAX_PROMPT_CHARS = 600_000
+PROCESS_TERMINATE_GRACE_SECONDS = 5
+TIMEOUT_RETURN_CODE = 124
+TIMEOUT_MESSAGE_PREFIX = "autoreview timeout:"
+ARCHIVE_SUFFIXES = (
+    ".tar.gz",
+    ".tar.bz2",
+    ".tar.xz",
+    ".tar.zst",
+    ".zip",
+    ".tar",
+    ".tgz",
+    ".tbz",
+    ".tbz2",
+    ".txz",
+    ".tzst",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".zst",
+    ".7z",
+    ".rar",
+)
+BUNDLE_ALWAYS_EXCLUDED_DIRS = {".git"}
+BUNDLE_ALWAYS_EXCLUDED_FILES = {".git"}
+BUNDLE_MANIFEST_PATH = "__bundle__/manifest.md"
+BUNDLE_VIRTUAL_PATHS = {BUNDLE_MANIFEST_PATH}
+BUNDLE_EXCLUDED_DIRS = {
+    ".cache",
+    ".gradle",
+    ".mypy_cache",
+    ".next",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "build",
+    "coverage",
+    "dist",
+    "env",
+    "node_modules",
+    "out",
+    "target",
+    "tmp",
+    "venv",
+    "__pycache__",
+}
+BUNDLE_EXCLUDED_FILES = {".DS_Store"}
+BUNDLE_EXCLUDED_SUFFIXES = {".class", ".dll", ".dylib", ".o", ".pyc", ".pyo", ".so"}
+CLAUDE_READ_ONLY_TOOLS = {"Read", "Grep", "Glob", "WebSearch", "WebFetch"}
+CLAUDE_WEB_TOOLS = {"WebSearch", "WebFetch"}
+GIT_HARDENING_CONFIG = (
+    "core.fsmonitor=false",
+    "core.untrackedCache=false",
+    "diff.external=",
+)
+GIT_DIFF_COMMANDS = {"diff", "show"}
+ENGINE_ENV_KEYS = {
+    "codex": {"OPENAI_API_KEY"},
+    "claude": {"ANTHROPIC_API_KEY"},
+    "droid": {"DROID_API_KEY", "OPENAI_API_KEY"},
+    "copilot": {"COPILOT_API_KEY"},
+}
+REDACTED_COMMAND_OPTIONS = {
+    "--target",
+    "--codex-bin",
+    "--claude-bin",
+    "--droid-bin",
+    "--copilot-bin",
+    "--prompt",
+    "--prompt-file",
+    "--dataset",
+    "--output",
+    "--json-output",
+    "--parallel-tests",
+}
+THINKING_LEVELS_BY_ENGINE = {
+    "codex": {"low", "medium", "high", "xhigh"},
+    "claude": {"low", "medium", "high", "xhigh", "max"},
+    "droid": set(),
+    "copilot": set(),
+}
+
+
+SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "findings",
+        "overall_correctness",
+        "overall_explanation",
+        "overall_confidence",
+    ],
+    "properties": {
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "title",
+                    "body",
+                    "priority",
+                    "confidence",
+                    "category",
+                    "code_location",
+                ],
+                "properties": {
+                    "title": {"type": "string", "minLength": 1, "maxLength": 140},
+                    "body": {"type": "string", "minLength": 1, "maxLength": 2000},
+                    "priority": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "category": {
+                        "type": "string",
+                        "enum": ["bug", "security", "regression", "test_gap", "maintainability"],
+                    },
+                    "code_location": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["file_path", "line"],
+                        "properties": {
+                            "file_path": {"type": "string", "minLength": 1},
+                            "line": {"type": "integer", "minimum": 1},
+                        },
+                    },
+                },
+            },
+        },
+        "overall_correctness": {
+            "type": "string",
+            "enum": ["patch is correct", "patch is incorrect"],
+        },
+        "overall_explanation": {"type": "string", "minLength": 1, "maxLength": 3000},
+        "overall_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    },
+}
+
+
+def run(
+    args: list[str],
+    cwd: Path,
+    *,
+    input_text: str | None = None,
+    check: bool = True,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        args,
+        cwd=cwd,
+        input=input_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    if check and result.returncode != 0:
+        cmd = " ".join(args)
+        raise SystemExit(f"command failed ({result.returncode}): {cmd}\n{result.stderr or result.stdout}")
+    return result
+
+
+def nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected a non-negative integer: {value}") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"expected a non-negative integer: {value}")
+    return parsed
+
+
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected a positive integer: {value}") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"expected a positive integer: {value}")
+    return parsed
+
+
+def process_group_kwargs() -> dict[str, Any]:
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        return {"creationflags": creationflags} if creationflags else {}
+    return {"start_new_session": True}
+
+
+def terminate_process_group(proc: subprocess.Popen, *, force: bool = False) -> None:
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        command = ["taskkill", "/PID", str(proc.pid), "/T"]
+        if force:
+            command.append("/F")
+        try:
+            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            if result.returncode == 0:
+                return
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if proc.poll() is not None:
+            return
+        try:
+            if force:
+                proc.kill()
+            else:
+                proc.terminate()
+        except OSError:
+            return
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL if force else signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError:
+        if force:
+            proc.kill()
+        else:
+            proc.terminate()
+
+
+def timeout_message(label: str, timeout_seconds: int, started: float, pid: int) -> str:
+    elapsed = int(time.monotonic() - started)
+    return f"{TIMEOUT_MESSAGE_PREFIX} {label} exceeded timeout={timeout_seconds}s elapsed={elapsed}s pid={pid}; terminated"
+
+
+def append_stderr(stderr: str | None, message: str) -> str:
+    prefix = stderr or ""
+    separator = "" if not prefix or prefix.endswith("\n") else "\n"
+    return prefix + separator + message + "\n"
+
+
+def terminate_timed_out_process(
+    proc: subprocess.Popen,
+    args: list[str],
+    *,
+    label: str,
+    timeout_seconds: int,
+    started: float,
+) -> subprocess.CompletedProcess[str]:
+    message = timeout_message(label, timeout_seconds, started, proc.pid)
+    print(message, file=sys.stderr, flush=True)
+    terminate_process_group(proc)
+    try:
+        stdout, stderr = proc.communicate(timeout=PROCESS_TERMINATE_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        terminate_process_group(proc, force=True)
+        stdout, stderr = proc.communicate()
+    return subprocess.CompletedProcess(args, TIMEOUT_RETURN_CODE, stdout or "", append_stderr(stderr, message))
+
+
+def timed_wait_seconds(deadline: float | None, heartbeat_seconds: int) -> float:
+    if deadline is None:
+        return float(heartbeat_seconds)
+    remaining = deadline - time.monotonic()
+    return max(0.001, min(float(heartbeat_seconds), remaining))
+
+
+def deadline_exceeded(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
+
+
+def run_with_heartbeat(
+    args: list[str],
+    cwd: Path,
+    *,
+    input_text: str | None = None,
+    label: str,
+    heartbeat_seconds: int = 60,
+    timeout_seconds: int = DEFAULT_ENGINE_TIMEOUT_SECONDS,
+    stream_output: bool = False,
+    stream_display: Callable[[str, str], str | None] | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    if stream_output:
+        return run_with_stream(
+            args,
+            cwd,
+            input_text=input_text,
+            label=label,
+            heartbeat_seconds=heartbeat_seconds,
+            timeout_seconds=timeout_seconds,
+            stream_display=stream_display,
+            env=env,
+        )
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    proc = subprocess.Popen(
+        args,
+        cwd=cwd,
+        stdin=subprocess.PIPE if input_text is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        **process_group_kwargs(),
+    )
+    first_communicate = True
+    while True:
+        if deadline_exceeded(deadline):
+            return terminate_timed_out_process(proc, args, label=label, timeout_seconds=timeout_seconds, started=started)
+        try:
+            stdout, stderr = proc.communicate(
+                input=input_text if first_communicate else None,
+                timeout=timed_wait_seconds(deadline, heartbeat_seconds),
+            )
+            return subprocess.CompletedProcess(args, int(proc.returncode or 0), stdout, stderr)
+        except subprocess.TimeoutExpired:
+            first_communicate = False
+            elapsed = int(time.monotonic() - started)
+            if deadline_exceeded(deadline):
+                return terminate_timed_out_process(proc, args, label=label, timeout_seconds=timeout_seconds, started=started)
+            print(f"review still running: {label} elapsed={elapsed}s pid={proc.pid}", file=sys.stderr, flush=True)
+
+
+def run_with_stream(
+    args: list[str],
+    cwd: Path,
+    *,
+    input_text: str | None,
+    label: str,
+    heartbeat_seconds: int,
+    timeout_seconds: int,
+    stream_display: Callable[[str, str], str | None] | None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    proc = subprocess.Popen(
+        args,
+        cwd=cwd,
+        stdin=subprocess.PIPE if input_text is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=env,
+        **process_group_kwargs(),
+    )
+    events: queue.Queue[tuple[str, str | None]] = queue.Queue()
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+
+    def read_stream(name: str, stream: Any) -> None:
+        try:
+            for line in iter(stream.readline, ""):
+                events.put((name, line))
+        finally:
+            events.put((name, None))
+
+    def write_stdin() -> None:
+        if proc.stdin is None or input_text is None:
+            return
+        try:
+            proc.stdin.write(input_text)
+            proc.stdin.close()
+        except BrokenPipeError:
+            return
+
+    threads = [
+        threading.Thread(target=read_stream, args=("stdout", proc.stdout), daemon=True),
+        threading.Thread(target=read_stream, args=("stderr", proc.stderr), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    stdin_thread = threading.Thread(target=write_stdin, daemon=True)
+    stdin_thread.start()
+
+    open_streams = 2
+    while open_streams:
+        if deadline_exceeded(deadline):
+            message = timeout_message(label, timeout_seconds, started, proc.pid)
+            print(message, file=sys.stderr, flush=True)
+            terminate_process_group(proc)
+            try:
+                proc.wait(timeout=PROCESS_TERMINATE_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                terminate_process_group(proc, force=True)
+                proc.wait()
+            stderr_parts.append(message + "\n")
+            break
+        try:
+            name, line = events.get(timeout=timed_wait_seconds(deadline, heartbeat_seconds))
+        except queue.Empty:
+            elapsed = int(time.monotonic() - started)
+            if deadline_exceeded(deadline):
+                message = timeout_message(label, timeout_seconds, started, proc.pid)
+                print(message, file=sys.stderr, flush=True)
+                terminate_process_group(proc)
+                try:
+                    proc.wait(timeout=PROCESS_TERMINATE_GRACE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    terminate_process_group(proc, force=True)
+                    proc.wait()
+                stderr_parts.append(message + "\n")
+                break
+            print(f"review still running: {label} elapsed={elapsed}s pid={proc.pid}", file=sys.stderr, flush=True)
+            continue
+        if line is None:
+            open_streams -= 1
+            continue
+        if name == "stdout":
+            stdout_parts.append(line)
+        else:
+            stderr_parts.append(line)
+        display = stream_display(name, line) if stream_display else line
+        if display:
+            target = sys.stdout if name == "stdout" else sys.stderr
+            target.write(display)
+            target.flush()
+
+    for thread in threads:
+        thread.join(timeout=PROCESS_TERMINATE_GRACE_SECONDS)
+    stdin_thread.join(timeout=1)
+    if deadline_exceeded(deadline) and proc.poll() is None:
+        message = timeout_message(label, timeout_seconds, started, proc.pid)
+        print(message, file=sys.stderr, flush=True)
+        terminate_process_group(proc)
+        try:
+            proc.wait(timeout=PROCESS_TERMINATE_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            terminate_process_group(proc, force=True)
+            proc.wait()
+        stderr_parts.append(message + "\n")
+    else:
+        wait_timeout = None if deadline is None else max(0.001, deadline - time.monotonic())
+        try:
+            proc.wait(timeout=wait_timeout)
+        except subprocess.TimeoutExpired:
+            message = timeout_message(label, timeout_seconds, started, proc.pid)
+            print(message, file=sys.stderr, flush=True)
+            terminate_process_group(proc)
+            try:
+                proc.wait(timeout=PROCESS_TERMINATE_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                terminate_process_group(proc, force=True)
+                proc.wait()
+            stderr_parts.append(message + "\n")
+    returncode = TIMEOUT_RETURN_CODE if any(part.startswith(TIMEOUT_MESSAGE_PREFIX) for part in stderr_parts) else proc.returncode
+    return subprocess.CompletedProcess(args, returncode, "".join(stdout_parts), "".join(stderr_parts))
+
+
+def git_env() -> dict[str, str]:
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    return env
+
+
+def hardened_git_command(git_bin: str, args: tuple[str, ...]) -> list[str]:
+    command = args[0] if args else ""
+    config_args = [item for config in GIT_HARDENING_CONFIG for item in ("-c", config)]
+    if command in GIT_DIFF_COMMANDS:
+        return [git_bin, *config_args, command, "--no-ext-diff", "--no-textconv", *args[1:]]
+    return [git_bin, *config_args, *args]
+
+
+def git(repo: Path, *args: str, check: bool = True) -> str:
+    git_bin = resolve_command("git", repo)
+    return run(hardened_git_command(git_bin, args), repo, check=check, env=git_env()).stdout
+
+
+def repo_root() -> Path:
+    start = Path.cwd().resolve()
+    unsafe_root = discover_repo_root(start) or start
+    git_bin = find_command("git", unsafe_root)
+    if not git_bin:
+        raise SystemExit("git executable not found. Install Git or add it to PATH.")
+    result = subprocess.run(
+        hardened_git_command(git_bin, ("rev-parse", "--show-toplevel")),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=git_env(),
+    )
+    if result.returncode != 0:
+        raise SystemExit("autoreview must run inside a git repository")
+    return Path(result.stdout.strip()).resolve()
+
+
+def discover_repo_root(start: Path) -> Path | None:
+    current = start
+    while True:
+        if (current / ".git").exists():
+            return current
+        if current.parent == current:
+            return None
+        current = current.parent
+
+
+def current_branch(repo: Path) -> str:
+    return git(repo, "branch", "--show-current", check=False).strip() or "detached"
+
+
+def is_dirty(repo: Path) -> bool:
+    return bool(git(repo, "status", "--porcelain").strip())
+
+
+def choose_target(repo: Path, mode: str, base_ref: str | None) -> tuple[str, str | None]:
+    mode = "local" if mode == "uncommitted" else mode
+    branch = current_branch(repo)
+    if mode == "local" or (mode == "auto" and is_dirty(repo)):
+        return "local", None
+    if mode == "commit":
+        return "commit", None
+    if mode == "branch" or (mode == "auto" and branch != "main"):
+        return "branch", base_ref or detect_pr_base(repo) or "origin/main"
+    raise SystemExit("no review target: clean main checkout and no forced mode")
+
+
+def validate_git_ref(ref: str, option: str) -> None:
+    if not ref or ref.startswith("-"):
+        raise SystemExit(f"{option} must be a non-empty git ref and must not start with '-': {ref!r}")
+
+
+def enforce_head_commit(repo: Path, commit_ref: str) -> None:
+    if git(repo, "rev-parse", commit_ref).strip() != git(repo, "rev-parse", "HEAD").strip():
+        raise SystemExit("--mode commit currently reviews only HEAD so reviewer cwd and line counts match the reviewed commit")
+
+
+def enforce_clean_ref_review(repo: Path, target: str) -> None:
+    if target in {"branch", "commit"} and is_dirty(repo):
+        raise SystemExit(f"--mode {target} requires a clean worktree so reviewers cannot inspect dirty live files; commit/stash changes or use --mode local")
+
+
+def detect_pr_base(repo: Path) -> str | None:
+    gh_bin = find_command("gh", repo)
+    if not gh_bin:
+        return None
+    result = run([gh_bin, "pr", "view", "--json", "baseRefName", "--jq", ".baseRefName"], repo, check=False)
+    base = result.stdout.strip()
+    return f"origin/{base}" if result.returncode == 0 and base else None
+
+
+def resolve_command(name: str, repo: Path, *, extra_reject_roots: Iterable[Path] = ()) -> str:
+    resolved = find_command(name, repo, extra_reject_roots=extra_reject_roots)
+    if resolved:
+        return resolved
+    raise SystemExit(
+        f"executable not found or rejected inside reviewed target: {name}. "
+        "Install it on an absolute PATH entry or pass a trusted absolute path outside the reviewed target."
+    )
+
+
+def resolved_reject_roots(repo: Path, extra_reject_roots: Iterable[Path] = ()) -> list[Path]:
+    roots: list[Path] = []
+    for root in (repo, *extra_reject_roots):
+        try:
+            roots.append(root.resolve())
+        except OSError:
+            continue
+    return roots
+
+
+def find_command(name: str, repo: Path, *, extra_reject_roots: Iterable[Path] = ()) -> str | None:
+    reject_roots = resolved_reject_roots(repo, extra_reject_roots)
+    command = Path(name)
+    if has_directory_component(name, command):
+        base = command if command.is_absolute() else repo / command
+        return first_executable_candidate(base, reject_roots=reject_roots)
+    for part in os.environ.get("PATH", "").split(os.pathsep):
+        if not part or part == ".":
+            continue
+        path_part = Path(part)
+        if not path_part.is_absolute():
+            continue
+        try:
+            resolved_part = path_part.resolve()
+        except OSError:
+            continue
+        if is_within_any(resolved_part, reject_roots):
+            continue
+        found = first_executable_candidate(resolved_part / name, reject_roots=reject_roots)
+        if found:
+            return found
+    return None
+
+
+def is_within(path: Path, root: Path) -> bool:
+    return path == root or path.is_relative_to(root)
+
+
+def is_within_any(path: Path, roots: Iterable[Path]) -> bool:
+    return any(is_within(path, root) for root in roots)
+
+
+def has_directory_component(name: str, command: Path) -> bool:
+    separators = [separator for separator in (os.sep, os.altsep) if separator]
+    return command.is_absolute() or bool(command.drive) or any(separator in name for separator in separators)
+
+
+def first_executable_candidate(path: Path, *, reject_roots: Iterable[Path] = ()) -> str | None:
+    if os.name == "nt" and not path.suffix:
+        extensions = [ext for ext in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if ext]
+        candidates = [path.with_suffix(ext.lower()) for ext in extensions]
+        candidates.extend(path.with_suffix(ext.upper()) for ext in extensions)
+        candidates.append(path)
+    else:
+        candidates = [path]
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            try:
+                if is_within_any(candidate.resolve(), reject_roots):
+                    continue
+            except OSError:
+                continue
+            return str(candidate)
+    return None
+
+
+def safe_temp_parent(protected: Path) -> Path:
+    protected = protected.resolve()
+    candidates: list[Path] = []
+    override = os.environ.get("AUTOREVIEW_TMPDIR")
+    if override:
+        candidates.append(Path(override))
+    candidates.extend([Path("/tmp"), Path("/var/tmp"), Path(tempfile.gettempdir()), Path.home() / ".cache" / "autoreview-tmp"])
+    seen: set[Path] = set()
+    for candidate in candidates:
+        raw = candidate.expanduser()
+        try:
+            planned = raw.resolve(strict=False)
+        except OSError:
+            continue
+        if planned in seen:
+            continue
+        seen.add(planned)
+        if is_within(planned, protected):
+            continue
+        try:
+            raw.mkdir(parents=True, exist_ok=True)
+            resolved = raw.resolve()
+        except OSError:
+            continue
+        if not resolved.is_dir() or is_within(resolved, protected):
+            continue
+        return resolved
+    raise SystemExit(f"no safe temporary directory outside reviewed target: {protected}")
+
+
+def safe_mkdtemp(prefix: str, protected: Path) -> Path:
+    parent = safe_temp_parent(protected)
+    path = Path(tempfile.mkdtemp(prefix=prefix, dir=str(parent))).resolve()
+    if is_within(path, protected.resolve()):
+        shutil.rmtree(path, ignore_errors=True)
+        raise SystemExit(f"temporary directory would be inside reviewed target: {path}")
+    atexit.register(clean_temp_tree, path)
+    return path
+
+
+def chmod_for_cleanup(path: Path, *, is_directory: bool) -> None:
+    try:
+        os.chmod(path, 0o700 if is_directory else 0o600)
+    except OSError:
+        return
+
+
+def clean_temp_tree(path: Path) -> None:
+    if not path.exists():
+        return
+    for dirpath, dirnames, filenames in os.walk(path, topdown=False):
+        directory = Path(dirpath)
+        for filename in filenames:
+            child = directory / filename
+            if not child.is_symlink():
+                chmod_for_cleanup(child, is_directory=False)
+        for dirname in dirnames:
+            child = directory / dirname
+            if not child.is_symlink():
+                chmod_for_cleanup(child, is_directory=True)
+        chmod_for_cleanup(directory, is_directory=True)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def helper_temp_dir(args: argparse.Namespace) -> Path:
+    configured = getattr(args, "helper_temp_dir", None)
+    if configured:
+        return Path(configured)
+    temp_dir = safe_mkdtemp("autoreview-helper.", Path.cwd().resolve())
+    args.helper_temp_dir = temp_dir
+    return temp_dir
+
+
+def bounded(text: str, limit: int = 180_000) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n\n[truncated at {limit} characters]\n"
+
+
+def bounded_field(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    suffix = "\n\n[truncated]"
+    return text[: max(0, limit - len(suffix))] + suffix
+
+
+def read_text(path: Path, limit: int = 40_000) -> str:
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        return f"[unreadable: {exc}]"
+    return text_from_bytes(data, limit)
+
+
+def symlink_target_text(path: Path) -> str:
+    try:
+        return os.readlink(path)
+    except OSError as exc:
+        return f"[unreadable symlink target: {exc}]"
+
+
+def symlink_bundle_text(path: Path) -> str:
+    return f"[symlink target omitted: {symlink_target_text(path)}]"
+
+
+def symlink_identity(rel: str, path: Path) -> str:
+    target = symlink_target_text(path)
+    digest = sha256_text(target)
+    return f"- {rel} mode:120000 symlink_target_sha256:{digest} target:{target}"
+
+
+def text_from_bytes(data: bytes, limit: int = 40_000) -> str:
+    if b"\0" in data:
+        return "[binary file omitted]"
+    text = data.decode("utf-8", errors="replace")
+    return bounded(text, limit)
+
+
+def text_line_count(data: bytes) -> int | None:
+    if b"\0" in data:
+        return None
+    return max(1, len(data.decode("utf-8", errors="replace").splitlines()))
+
+
+def file_header(path: Path, limit: int = 4096) -> bytes:
+    with path.open("rb") as handle:
+        return handle.read(limit)
+
+
+def looks_like_archive(header: bytes) -> bool:
+    return (
+        header.startswith(b"PK\x03\x04")
+        or header.startswith(b"PK\x05\x06")
+        or header.startswith(b"\x1f\x8b")
+        or header.startswith(b"BZh")
+        or header.startswith(b"\xfd7zXZ\x00")
+        or header.startswith(b"7z\xbc\xaf\x27\x1c")
+        or header.startswith(b"Rar!\x1a\x07")
+        or header.startswith(b"\x28\xb5\x2f\xfd")
+        or header[257:262] == b"ustar"
+    )
+
+
+def looks_binary(header: bytes) -> bool:
+    if b"\0" in header:
+        return True
+    if not header:
+        return False
+    try:
+        text = header.decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+    controls = sum(1 for char in text if ord(char) < 32 and char not in "\n\r\t\f\b")
+    return controls / max(len(text), 1) > 0.02
+
+
+def path_line_count(path: Path) -> int | None:
+    if path.is_symlink():
+        return None
+    try:
+        return text_line_count(path.read_bytes())
+    except OSError:
+        return None
+
+
+def read_regular_file_no_follow(path: Path) -> tuple[bytes, os.stat_result]:
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise SystemExit(f"failed to stat bundle file {path}: {exc}") from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise SystemExit(f"bundle target changed or is not a regular file: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise SystemExit(f"failed to open bundle file without following symlinks {path}: {exc}") from exc
+    with os.fdopen(fd, "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise SystemExit(f"bundle target changed while being read: {path}")
+        return handle.read(), opened
+
+
+def ancestor_stats(path: Path, root: Path) -> dict[Path, tuple[int, int, int]]:
+    stats: dict[Path, tuple[int, int, int]] = {}
+    current = root.resolve()
+    target = path.resolve(strict=False)
+    try:
+        relative = target.relative_to(current)
+    except ValueError as exc:
+        raise SystemExit(f"bundle file escaped target root: {path}") from exc
+    for part in relative.parts[:-1]:
+        current = current / part
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise SystemExit(f"failed to stat bundle directory {current}: {exc}") from exc
+        if not stat.S_ISDIR(info.st_mode):
+            raise SystemExit(f"bundle ancestor is not a directory: {current}")
+        stats[current] = (info.st_dev, info.st_ino, stat.S_IMODE(info.st_mode))
+    return stats
+
+
+def verify_ancestor_stats(stats: dict[Path, tuple[int, int, int]]) -> None:
+    for directory, (dev, ino, _mode) in stats.items():
+        try:
+            current = directory.lstat()
+        except OSError as exc:
+            raise SystemExit(f"failed to re-stat bundle directory {directory}: {exc}") from exc
+        if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != (dev, ino):
+            raise SystemExit(f"bundle directory changed while freezing: {directory}")
+
+
+def read_only_mode(mode: int, *, is_directory: bool) -> int:
+    normalized = stat.S_IMODE(mode) & 0o777
+    if is_directory:
+        normalized |= 0o500
+        normalized |= (normalized & 0o444) >> 2
+    else:
+        normalized |= 0o400
+        normalized |= (normalized & 0o111) << 2
+    return normalized & ~0o222
+
+
+def chmod_read_only(path: Path, mode: int, *, is_directory: bool) -> None:
+    try:
+        os.chmod(path, read_only_mode(mode, is_directory=is_directory))
+    except OSError as exc:
+        raise SystemExit(f"failed to chmod frozen bundle copy read-only: {path} ({exc})") from exc
+
+
+def make_tree_read_only(root: Path) -> None:
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        directory = Path(dirpath)
+        for filename in filenames:
+            path = directory / filename
+            if not path.is_symlink():
+                chmod_read_only(path, path.lstat().st_mode, is_directory=False)
+        for dirname in dirnames:
+            path = directory / dirname
+            if not path.is_symlink():
+                chmod_read_only(path, path.lstat().st_mode, is_directory=True)
+        chmod_read_only(directory, directory.lstat().st_mode, is_directory=True)
+
+
+def copy_regular_file_no_follow(source: Path, destination: Path) -> None:
+    data, source_stat = read_regular_file_no_follow(source)
+    destination.write_bytes(data)
+    os.chmod(destination, stat.S_IMODE(source_stat.st_mode))
+    os.utime(destination, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+def text_summary(text: str) -> str:
+    return f"{len(text)} chars sha256:{sha256_text(text)}"
+
+
+def command_summary(command: str) -> str:
+    return f"<redacted {text_summary(command)}>"
+
+
+def completed_process_failure(engine: str, result: subprocess.CompletedProcess[str]) -> str:
+    parts = [f"{engine} engine failed ({result.returncode})"]
+    if result.returncode == TIMEOUT_RETURN_CODE and result.stderr:
+        timeout_lines = [line for line in result.stderr.splitlines() if line.startswith(TIMEOUT_MESSAGE_PREFIX)]
+        parts.extend(timeout_lines[-1:])
+    if result.stderr:
+        parts.append(f"stderr: {text_summary(result.stderr)}")
+    if result.stdout:
+        parts.append(f"stdout: {text_summary(result.stdout)}")
+    return "\n".join(parts)
+
+
+def json_shape_summary(value: Any) -> str:
+    if isinstance(value, dict):
+        return f"object key_count:{len(value)}"
+    if isinstance(value, list):
+        return f"array length:{len(value)}"
+    return type(value).__name__
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def local_bundle(repo: Path) -> str:
+    parts = [
+        "# Git Status",
+        git(repo, "status", "--short"),
+        "# Staged Diff",
+        git(repo, "diff", "--cached", "--stat"),
+        bounded(git(repo, "diff", "--cached", "--patch", "--binary", "--find-renames")),
+        "# Unstaged Diff",
+        git(repo, "diff", "--stat"),
+        bounded(git(repo, "diff", "--patch", "--binary", "--find-renames")),
+    ]
+    untracked = [line for line in git(repo, "ls-files", "--others", "--exclude-standard").splitlines() if line]
+    if untracked:
+        parts.append("# Untracked Files")
+        for rel in untracked:
+            path = repo / rel
+            body = symlink_bundle_text(path) if path.is_symlink() else read_text(path)
+            parts.append(f"## {rel}\n{body}")
+    return "\n\n".join(parts)
+
+
+def branch_bundle(repo: Path, base_ref: str) -> str:
+    return "\n\n".join(
+        [
+            "# Branch Diff",
+            f"base: {base_ref}",
+            git(repo, "diff", "--stat", f"{base_ref}...HEAD"),
+            bounded(git(repo, "diff", "--patch", "--binary", "--find-renames", f"{base_ref}...HEAD")),
+        ]
+    )
+
+
+def commit_bundle(repo: Path, commit_ref: str) -> str:
+    return "\n\n".join(
+        [
+            "# Commit Diff",
+            f"commit: {commit_ref}",
+            git(repo, "show", "--stat", "--format=fuller", commit_ref),
+            bounded(git(repo, "show", "--patch", "--binary", "--find-renames", "--format=fuller", commit_ref)),
+        ]
+    )
+
+
+def is_archive_path(path: Path, header: bytes | None = None) -> bool:
+    name = path.name.lower()
+    if any(name.endswith(suffix) for suffix in ARCHIVE_SUFFIXES):
+        return True
+    return looks_like_archive(header if header is not None else file_header(path))
+
+
+def is_generated_bundle_file(path: Path) -> bool:
+    return path.name in BUNDLE_EXCLUDED_FILES or path.suffix in BUNDLE_EXCLUDED_SUFFIXES
+
+
+def iter_content_bundle_entries(target_path: Path, *, include_generated: bool) -> tuple[list[Path], list[Path], list[str]]:
+    if target_path.is_symlink():
+        target_path = target_path.resolve()
+    if not target_path.exists():
+        raise SystemExit(f"bundle target not found: {target_path}")
+    if target_path.is_file():
+        header = file_header(target_path)
+        if is_archive_path(target_path, header):
+            raise SystemExit(f"archive bundle targets are not expanded; extract and freeze a directory first: {target_path}")
+        if looks_binary(header):
+            raise SystemExit(f"single-file binary bundle targets are opaque; place the file in a frozen directory with review context instead: {target_path}")
+        return [target_path], [], []
+    if not target_path.is_dir():
+        raise SystemExit(f"bundle target must be a file or directory: {target_path}")
+    files: list[Path] = []
+    directories: list[Path] = []
+    excluded: list[str] = []
+    def raise_walk_error(error: OSError) -> None:
+        raise SystemExit(f"failed to enumerate bundle directory {error.filename}: {error}") from error
+
+    for dirpath, dirnames, filenames in os.walk(target_path, onerror=raise_walk_error):
+        directory = Path(dirpath)
+        excluded_dirnames = set(BUNDLE_ALWAYS_EXCLUDED_DIRS)
+        if not include_generated:
+            excluded_dirnames |= BUNDLE_EXCLUDED_DIRS
+        kept_dirnames = []
+        for dirname in dirnames:
+            if dirname in excluded_dirnames:
+                excluded.append((directory / dirname).relative_to(target_path).as_posix() + "/")
+            else:
+                kept_dirnames.append(dirname)
+        dirnames[:] = sorted(kept_dirnames)
+        for dirname in dirnames:
+            child = directory / dirname
+            if child.is_symlink():
+                raise SystemExit(f"bundle target contains symlink; freeze a resolved copy instead: {child}")
+            directories.append(child)
+        for filename in sorted(filenames):
+            path = directory / filename
+            if path.is_symlink():
+                raise SystemExit(f"bundle target contains symlink; freeze a resolved copy instead: {path}")
+            if not path.is_file():
+                continue
+            if filename in BUNDLE_ALWAYS_EXCLUDED_FILES:
+                excluded.append(path.relative_to(target_path).as_posix())
+                continue
+            if not include_generated and is_generated_bundle_file(path):
+                excluded.append(path.relative_to(target_path).as_posix())
+                continue
+            files.append(path)
+    return files, sorted(directories), sorted(excluded)
+
+
+def iter_content_bundle_files(target_path: Path, *, include_generated: bool) -> tuple[list[Path], list[str]]:
+    files, _directories, excluded = iter_content_bundle_entries(target_path, include_generated=include_generated)
+    return files, excluded
+
+
+def bundle_content_stats(target_path: Path, *, include_generated: bool) -> dict[str, int]:
+    files, directories, excluded = iter_content_bundle_entries(target_path, include_generated=include_generated)
+    total_bytes = 0
+    for path in files:
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise SystemExit(f"failed to stat bundle file for preflight: {path} ({exc})") from exc
+        if not stat.S_ISREG(info.st_mode):
+            raise SystemExit(f"bundle target changed or is not a regular file during preflight: {path}")
+        total_bytes += info.st_size
+    return {
+        "files": len(files),
+        "directories": len(directories),
+        "excluded": len(excluded),
+        "total_bytes": total_bytes,
+    }
+
+
+def enforce_preflight_limit(name: str, value: int, limit: int, override: str) -> None:
+    if limit <= 0:
+        raise SystemExit(
+            f"bundle preflight {name} must be a positive integer. "
+            f"Pass {override} for an explicit large-bundle run."
+        )
+    if value > limit:
+        raise SystemExit(
+            f"bundle preflight exceeded {name}: {value} > {limit}. "
+            f"Increase the limit or pass {override} for an explicit large-bundle run."
+        )
+
+
+def enforce_bundle_content_preflight_limits(
+    args: argparse.Namespace,
+    target_ref: str,
+    *,
+    include_generated: bool,
+) -> dict[str, int]:
+    stats = bundle_content_stats(Path(target_ref).resolve(), include_generated=include_generated)
+    if not args.allow_large_bundle:
+        enforce_preflight_limit("--bundle-max-files", stats["files"], args.bundle_max_files, "--allow-large-bundle")
+        enforce_preflight_limit(
+            "--bundle-max-total-bytes",
+            stats["total_bytes"],
+            args.bundle_max_total_bytes,
+            "--allow-large-bundle",
+        )
+    return stats
+
+
+def enforce_bundle_prompt_preflight_limit(args: argparse.Namespace, prompt: str) -> None:
+    if args.allow_large_bundle:
+        return
+    enforce_preflight_limit("--bundle-max-prompt-chars", len(prompt), args.bundle_max_prompt_chars, "--allow-large-bundle")
+
+
+def normalized_file_mode(path: Path) -> str:
+    return f"100{path.stat().st_mode & 0o777:03o}"
+
+
+def content_bundle(
+    target_path: Path,
+    *,
+    include_generated: bool,
+    preserved_excluded: list[str] | None = None,
+) -> tuple[str, set[str], dict[str, int], str]:
+    root = target_path.resolve()
+    files, directories, excluded = iter_content_bundle_entries(root, include_generated=include_generated)
+    excluded = sorted(set(excluded) | set(preserved_excluded or []))
+    kind = "file" if root.is_file() else "directory"
+    names: set[str] = set()
+    line_counts: dict[str, int] = {}
+    manifest: list[str] = []
+    file_sections: list[str] = []
+    for directory in directories:
+        rel = directory.relative_to(root).as_posix() + "/"
+        mode = f"040{directory.stat().st_mode & 0o777:03o}"
+        manifest.append(f"- {rel} mode:{mode}")
+    for path in files:
+        rel = path.name if root.is_file() else path.relative_to(root).as_posix()
+        data, file_stat = read_regular_file_no_follow(path)
+        if root.is_file() and looks_binary(data):
+            raise SystemExit(f"single-file binary bundle targets are opaque; place the file in a frozen directory with review context instead: {path}")
+        digest = sha256_bytes(data)
+        mode = f"100{stat.S_IMODE(file_stat.st_mode):03o}"
+        line_count = text_line_count(data)
+        if line_count is not None:
+            line_counts[rel] = line_count
+        names.add(rel)
+        line_text = f" lines:{line_count}" if line_count is not None else ""
+        manifest.append(f"- {rel} mode:{mode} sha256:{digest} bytes:{len(data)}{line_text}")
+        file_sections.append(f"## {rel}\nmode: {mode}\nsha256: {digest}\nbytes: {len(data)}{line_text}\n\n{text_from_bytes(data)}")
+    if not files and not directories:
+        manifest.append("- [empty directory]")
+    parts = [
+        "# Content Bundle",
+        f"root: {root}",
+        f"kind: {kind}",
+        f"include_generated: {'true' if include_generated else 'false'}",
+        "",
+        "## Manifest",
+        "\n".join(manifest),
+    ]
+    if excluded:
+        parts.extend(["", "## Excluded Generated/Dependency/Build/Cache Paths", "\n".join(f"- {item}" for item in excluded)])
+    if file_sections:
+        parts.extend(["", "## Files", "\n\n".join(file_sections)])
+    identity_parts = [
+        "# Content Bundle Identity",
+        f"kind: {kind}",
+        f"include_generated: {'true' if include_generated else 'false'}",
+        "",
+        "## Manifest",
+        "\n".join(manifest),
+    ]
+    if excluded:
+        identity_parts.extend(["", "## Excluded Paths", "\n".join(f"- {item}" for item in excluded)])
+    return "\n".join(parts), names, line_counts, "\n".join(identity_parts)
+
+
+def repo_line_counts(repo: Path, paths: set[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for rel in paths:
+        path = repo / rel
+        if not path.is_file():
+            continue
+        line_count = path_line_count(path)
+        if line_count is not None:
+            counts[rel] = line_count
+    return counts
+
+
+def untracked_identity(repo: Path) -> str:
+    parts: list[str] = []
+    untracked = [line for line in git(repo, "ls-files", "--others", "--exclude-standard").splitlines() if line]
+    for rel in sorted(untracked):
+        path = repo / rel
+        if path.is_symlink():
+            parts.append(symlink_identity(rel, path))
+            continue
+        if not path.is_file():
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            parts.append(f"- {rel} unreadable:{exc}")
+            continue
+        parts.append(f"- {rel} mode:{normalized_file_mode(path)} sha256:{sha256_bytes(data)} bytes:{len(data)}")
+    return "\n".join(parts)
+
+
+def local_identity_material(repo: Path) -> str:
+    return "\n\n".join(
+        [
+            "# Local Identity",
+            git(repo, "status", "--porcelain=v1"),
+            "# Staged Diff Full",
+            git(repo, "diff", "--cached", "--patch", "--binary", "--find-renames"),
+            "# Unstaged Diff Full",
+            git(repo, "diff", "--patch", "--binary", "--find-renames"),
+            "# Untracked File Identity",
+            untracked_identity(repo),
+        ]
+    )
+
+
+def local_bundle_and_identity(repo: Path) -> tuple[str, str]:
+    status_short = git(repo, "status", "--short")
+    status_porcelain = git(repo, "status", "--porcelain=v1")
+    staged_stat = git(repo, "diff", "--cached", "--stat")
+    staged_patch = git(repo, "diff", "--cached", "--patch", "--binary", "--find-renames")
+    unstaged_stat = git(repo, "diff", "--stat")
+    unstaged_patch = git(repo, "diff", "--patch", "--binary", "--find-renames")
+    untracked = [line for line in git(repo, "ls-files", "--others", "--exclude-standard").splitlines() if line]
+    bundle_parts = [
+        "# Git Status",
+        status_short,
+        "# Staged Diff",
+        staged_stat,
+        bounded(staged_patch),
+        "# Unstaged Diff",
+        unstaged_stat,
+        bounded(unstaged_patch),
+    ]
+    if untracked:
+        bundle_parts.append("# Untracked Files")
+        for rel in untracked:
+            path = repo / rel
+            body = symlink_bundle_text(path) if path.is_symlink() else read_text(path)
+            bundle_parts.append(f"## {rel}\n{body}")
+    identity_parts = [
+        "# Local Identity",
+        status_porcelain,
+        "# Staged Diff Full",
+        staged_patch,
+        "# Unstaged Diff Full",
+        unstaged_patch,
+        "# Untracked File Identity",
+        untracked_identity(repo),
+    ]
+    return "\n\n".join(bundle_parts), "\n\n".join(identity_parts)
+
+
+def branch_identity_material(repo: Path, base_ref: str) -> str:
+    return "\n\n".join(
+        [
+            "# Branch Identity",
+            f"base: {base_ref}",
+            f"base_sha: {git(repo, 'rev-parse', base_ref).strip()}",
+            f"head_sha: {git(repo, 'rev-parse', 'HEAD').strip()}",
+            "# Branch Diff Full",
+            git(repo, "diff", "--patch", "--binary", "--find-renames", f"{base_ref}...HEAD"),
+        ]
+    )
+
+
+def branch_bundle_and_identity(repo: Path, base_ref: str) -> tuple[str, str]:
+    base_sha = git(repo, "rev-parse", base_ref).strip()
+    head_sha = git(repo, "rev-parse", "HEAD").strip()
+    stat_text = git(repo, "diff", "--stat", f"{base_ref}...HEAD")
+    patch = git(repo, "diff", "--patch", "--binary", "--find-renames", f"{base_ref}...HEAD")
+    bundle = "\n\n".join(["# Branch Diff", f"base: {base_ref}", stat_text, bounded(patch)])
+    identity = "\n\n".join(
+        [
+            "# Branch Identity",
+            f"base: {base_ref}",
+            f"base_sha: {base_sha}",
+            f"head_sha: {head_sha}",
+            "# Branch Diff Full",
+            patch,
+        ]
+    )
+    return bundle, identity
+
+
+def commit_identity_material(repo: Path, commit_ref: str) -> str:
+    return "\n\n".join(
+        [
+            "# Commit Identity",
+            f"commit: {git(repo, 'rev-parse', commit_ref).strip()}",
+            git(repo, "show", "--patch", "--binary", "--find-renames", "--format=fuller", commit_ref),
+        ]
+    )
+
+
+def commit_bundle_and_identity(repo: Path, commit_ref: str) -> tuple[str, str]:
+    commit_sha = git(repo, "rev-parse", commit_ref).strip()
+    stat_text = git(repo, "show", "--stat", "--format=fuller", commit_ref)
+    patch = git(repo, "show", "--patch", "--binary", "--find-renames", "--format=fuller", commit_ref)
+    bundle = "\n\n".join(["# Commit Diff", f"commit: {commit_ref}", stat_text, bounded(patch)])
+    identity = "\n\n".join(["# Commit Identity", f"commit: {commit_sha}", patch])
+    return bundle, identity
+
+
+def build_review_bundle(
+    repo: Path,
+    target: str,
+    target_ref: str | None,
+    commit_ref: str,
+    *,
+    include_generated: bool,
+    preserved_excluded: list[str] | None = None,
+) -> tuple[str, set[str], str | None, dict[str, int], str]:
+    if target == "local":
+        paths = review_paths(repo, target, target_ref, commit_ref)
+        bundle, identity_material = local_bundle_and_identity(repo)
+        return bundle, paths, target_ref, repo_line_counts(repo, paths), identity_material
+    if target == "branch":
+        assert target_ref
+        paths = review_paths(repo, target, target_ref, commit_ref)
+        bundle, identity_material = branch_bundle_and_identity(repo, target_ref)
+        return bundle, paths, target_ref, repo_line_counts(repo, paths), identity_material
+    if target == "commit":
+        paths = review_paths(repo, target, commit_ref, commit_ref)
+        bundle, identity_material = commit_bundle_and_identity(repo, commit_ref)
+        return bundle, paths, commit_ref, repo_line_counts(repo, paths), identity_material
+    if target == "bundle":
+        assert target_ref
+        bundle, paths, line_counts, identity_material = content_bundle(
+            Path(target_ref),
+            include_generated=include_generated,
+            preserved_excluded=preserved_excluded,
+        )
+        return bundle, paths | BUNDLE_VIRTUAL_PATHS, target_ref, line_counts, identity_material
+    raise SystemExit(f"unsupported review target: {target}")
+
+
+def review_paths(repo: Path, target: str, target_ref: str | None, commit_ref: str) -> set[str]:
+    names: set[str] = set()
+    if target == "local":
+        sources = [
+            git(repo, "diff", "--name-only", "--cached"),
+            git(repo, "diff", "--name-only"),
+            git(repo, "ls-files", "--others", "--exclude-standard"),
+        ]
+    elif target == "branch":
+        assert target_ref
+        sources = [git(repo, "diff", "--name-only", f"{target_ref}...HEAD")]
+    elif target == "commit":
+        sources = [git(repo, "show", "--name-only", "--format=", commit_ref)]
+    else:
+        raise SystemExit(f"review_paths does not support target: {target}")
+    for source in sources:
+        for line in source.splitlines():
+            path = line.strip()
+            if path:
+                names.add(path)
+    return names
+
+
+def load_extra_prompt(args: argparse.Namespace) -> str:
+    chunks: list[str] = []
+    for value in args.prompt or []:
+        chunks.append(value)
+    for path in args.prompt_file or []:
+        chunks.append(load_required_text_file(path, "--prompt-file"))
+    return "\n\n".join(chunks)
+
+
+def load_required_text_file(raw_path: str, option: str) -> str:
+    path = Path(raw_path).expanduser()
+    if path.is_symlink() or not path.exists() or not path.is_file():
+        raise SystemExit(f"{option} must be a readable regular file: {path}")
+    try:
+        return path.read_text()
+    except OSError as exc:
+        raise SystemExit(f"{option} is not readable: {path} ({exc})") from exc
+
+
+def load_datasets(args: argparse.Namespace) -> str:
+    chunks: list[str] = []
+    for spec in args.dataset or []:
+        path = Path(spec).expanduser()
+        chunks.append(f"# Dataset: {path}\n{load_required_text_file(spec, '--dataset')}")
+    return "\n\n".join(chunks)
+
+
+def command_reject_roots(args: argparse.Namespace) -> tuple[Path, ...]:
+    return tuple(getattr(args, "command_reject_roots", ()))
+
+
+def build_prompt(
+    repo: Path,
+    target: str,
+    target_ref: str | None,
+    bundle: str,
+    extra_prompt: str,
+    datasets: str,
+    *,
+    web_search: bool,
+) -> str:
+    target_line = f"{target} {target_ref}" if target_ref else target
+    role_line = (
+        "You are a senior artifact reviewer. Review the provided frozen content bundle only. If it is a plan, spec, docs, result bundle, or other non-code artifact, judge it against its stated purpose, constraints, approval/freshness rules, scope evidence, and review requirements."
+        if target == "bundle"
+        else "You are a senior code reviewer. Review the provided git change bundle only."
+    )
+    finding_scope = (
+        "- Report only actionable defects in the artifact against its stated purpose and constraints. If the schema says `patch`, interpret that as the reviewed artifact. For bundle-level or manifest-level defects, cite `__bundle__/manifest.md` line 1."
+        if target == "bundle"
+        else "- Report only actionable defects introduced or exposed by this change."
+    )
+    web_rule = (
+        "- You may use read-only tools and web search to inspect files, dependency contracts, upstream docs, current behavior, and security implications. Web searches must use minimal privacy-safe queries: do not include secrets, credentials, private URLs, proprietary code, customer/user data, non-public repository identifiers, or unnecessary local paths; prefer public package names, error identifiers, API names, and official docs."
+        if web_search
+        else "- You may use read-only tools to inspect files. Web search, web fetch, browser, and network fetch tools are disabled; do not use them."
+    )
+    return textwrap.dedent(
+        f"""
+        {role_line}
+
+        Hard rules:
+        - Return exactly one JSON object and nothing else. Do not wrap it in Markdown.
+        - The JSON object must match this schema exactly:
+        {json.dumps(SCHEMA, indent=2)}
+        - Do not modify files.
+        - Do not invoke nested reviewers, review tools, orchestration workflows, planning panels, extra panels, or additional agents/subagents.
+        - Forbidden nested commands and workflows include: codex review, autoreview, goal-orchestrator, claude review, oracle review, planning panels, reviewer panels, and agent/subagent creation.
+        {web_rule}
+        - Shell commands, if available, must be read-only inspection commands. Do not run tests, formatters, package installs, generators, network mutation commands, git mutation commands, or commands that write files.
+        {finding_scope}
+        - Prefer high-signal findings over style feedback.
+        - Include security findings: injection, secret leaks, authz/authn bypass, path traversal, unsafe deserialization, unsafe filesystem or shell use, privacy leaks, and credential handling.
+        - Do not reject legitimate functionality merely because it touches shell, filesystem, network, auth, or sensitive data. Report a security finding only when the patch creates a concrete exploitable risk, removes an important safety check, or lacks validation at a trust boundary.
+        - For each finding, use the smallest file/line location that demonstrates the issue.
+        - If there are no actionable findings, return an empty findings array and mark the patch correct.
+
+        Review target: {target_line}
+        Repository: {repo}
+
+        {extra_prompt}
+
+        {datasets}
+
+        # Review Bundle
+        {bundle}
+        """
+    ).strip()
+
+
+def write_json_temp(data: dict[str, Any], directory: Path) -> Path:
+    handle = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, dir=directory)
+    with handle:
+        json.dump(data, handle)
+    return Path(handle.name)
+
+
+def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
+    if not args.tools:
+        raise SystemExit("--no-tools is not supported by the Codex engine; use --engine claude --no-tools for a no-tools run")
+    temp_dir = helper_temp_dir(args)
+    schema_path = write_json_temp(SCHEMA, temp_dir)
+    output_path = Path(tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, dir=temp_dir).name)
+    cmd = [resolve_command(args.codex_bin, repo, extra_reject_roots=command_reject_roots(args)), "--ask-for-approval", "never"]
+    if args.web_search:
+        cmd.append("--search")
+    if args.model:
+        cmd.extend(["--model", args.model])
+    if args.thinking:
+        cmd.extend(["-c", f'model_reasoning_effort="{args.thinking}"'])
+    cmd.append("exec")
+    if args.mode == "bundle":
+        cmd.append("--skip-git-repo-check")
+    cmd.extend(["--ignore-user-config", "--ignore-rules"])
+    if args.stream_engine_output:
+        cmd.append("--json")
+    cmd.extend(
+        [
+            "--ephemeral",
+            "-C",
+            str(repo),
+            "-s",
+            "read-only",
+            "--output-schema",
+            str(schema_path),
+            "--output-last-message",
+            str(output_path),
+            "-",
+        ]
+    )
+    result = run_with_heartbeat(
+        cmd,
+        repo,
+        input_text=prompt,
+        label="codex",
+        stream_output=args.stream_engine_output,
+        stream_display=CodexStreamDisplay() if args.stream_engine_output else None,
+        env=isolated_engine_env(args, "codex"),
+        timeout_seconds=args.engine_timeout_seconds,
+    )
+    try:
+        output = output_path.read_text()
+    finally:
+        schema_path.unlink(missing_ok=True)
+        output_path.unlink(missing_ok=True)
+    if result.returncode != 0:
+        raise SystemExit(completed_process_failure("codex", result))
+    return output or result.stdout
+
+
+def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
+    cmd = [
+        resolve_command(args.claude_bin, repo, extra_reject_roots=command_reject_roots(args)),
+        "--print",
+        "--no-session-persistence",
+        "--output-format",
+        "stream-json" if args.stream_engine_output else "json",
+        "--json-schema",
+        json.dumps(SCHEMA),
+    ]
+    if args.tools:
+        allowed_tools = claude_allowed_tools(args)
+        if allowed_tools:
+            cmd.extend(["--tools", allowed_tools])
+        else:
+            cmd.extend(["--tools", ""])
+    else:
+        cmd.extend(["--tools", ""])
+    if args.stream_engine_output:
+        cmd.append("--verbose")
+    if args.model:
+        cmd.extend(["--model", args.model])
+    if args.thinking:
+        cmd.extend(["--effort", args.thinking])
+    result = run_with_heartbeat(
+        cmd,
+        repo,
+        input_text=prompt,
+        label="claude",
+        stream_output=args.stream_engine_output,
+        stream_display=ClaudeStreamDisplay() if args.stream_engine_output else None,
+        env=claude_env(args),
+        timeout_seconds=args.engine_timeout_seconds,
+    )
+    if result.returncode != 0:
+        raise SystemExit(completed_process_failure("claude", result))
+    return result.stdout
+
+
+def run_droid(args: argparse.Namespace, repo: Path, prompt: str) -> str:
+    if args.thinking:
+        raise SystemExit("--thinking is not supported by the droid engine")
+    prompt_path = Path(tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, dir=helper_temp_dir(args)).name)
+    prompt_path.write_text(prompt)
+    cmd = [
+        resolve_command(args.droid_bin, repo, extra_reject_roots=command_reject_roots(args)),
+        "exec",
+        "--cwd",
+        str(repo),
+        "--output-format",
+        "json",
+        "--disabled-tools",
+        "*",
+        "-f",
+        str(prompt_path),
+    ]
+    if args.model:
+        cmd.extend(["--model", args.model])
+    try:
+        result = run_with_heartbeat(
+            cmd,
+            repo,
+            label="droid",
+            stream_output=args.stream_engine_output,
+            env=isolated_engine_env(args, "droid"),
+            timeout_seconds=args.engine_timeout_seconds,
+        )
+    finally:
+        prompt_path.unlink(missing_ok=True)
+    if result.returncode != 0:
+        raise SystemExit(completed_process_failure("droid", result))
+    return result.stdout
+
+
+def run_copilot(args: argparse.Namespace, repo: Path, prompt: str) -> str:
+    if args.thinking:
+        raise SystemExit("--thinking is not supported by the copilot engine")
+    if not args.tools:
+        raise SystemExit("--no-tools is not supported by the copilot engine; copilot requires a read-only file view tool to load the review bundle without exposing it in argv")
+    with tempfile.TemporaryDirectory(prefix="autoreview-copilot.", dir=helper_temp_dir(args)) as tempdir:
+        prompt_path = Path(tempdir) / "prompt.txt"
+        prompt_path.write_text(prompt)
+        os.chmod(prompt_path, 0o600)
+        cmd = [
+            resolve_command(args.copilot_bin, repo, extra_reject_roots=command_reject_roots(args)),
+            "-C",
+            tempdir,
+            "-p",
+            "Read ./prompt.txt and follow it exactly. Return only the requested JSON object.",
+            "--output-format",
+            "json",
+            "--stream",
+            "on" if args.stream_engine_output else "off",
+            "--no-ask-user",
+            "--disable-builtin-mcps",
+        ]
+        if args.model:
+            cmd.extend(["--model", args.model])
+        available_tools = ["rg", "view"]
+        if args.web_search:
+            available_tools.append("web_fetch")
+        cmd.append(f"--available-tools={','.join(available_tools)}")
+        for tool in available_tools:
+            cmd.append(f"--allow-tool={tool}")
+        result = run_with_heartbeat(
+            cmd,
+            Path(tempdir),
+            label="copilot",
+            stream_output=args.stream_engine_output,
+            env=isolated_engine_env(args, "copilot"),
+            timeout_seconds=args.engine_timeout_seconds,
+        )
+    if result.returncode != 0:
+        raise SystemExit(completed_process_failure("copilot", result))
+    return result.stdout
+
+
+class CodexStreamDisplay:
+    def __init__(self, *, activity_seconds: int = 20) -> None:
+        self.activity_seconds = activity_seconds
+        self.hidden_events = 0
+        self.last_visible = time.monotonic()
+
+    def __call__(self, name: str, line: str) -> str | None:
+        if name != "stdout":
+            return line
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return self.visible(line)
+        event_type = event.get("type")
+        if event_type == "thread.started":
+            return self.visible(f"codex thread: {event.get('thread_id', '<unknown>')}\n")
+        if event_type == "turn.started":
+            return self.visible("codex turn started\n")
+        if event_type == "turn.completed":
+            usage = event.get("usage")
+            message = format_codex_usage(usage) + "\n" if isinstance(usage, dict) else "codex turn completed\n"
+            return self.visible(self.flush_hidden() + message)
+        item = event.get("item")
+        if isinstance(item, dict) and item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+            return self.visible(self.flush_hidden() + item["text"].rstrip() + "\n")
+        return self.hidden_activity()
+
+    def hidden_activity(self) -> str | None:
+        self.hidden_events += 1
+        if time.monotonic() - self.last_visible < self.activity_seconds:
+            return None
+        return self.visible(self.flush_hidden())
+
+    def flush_hidden(self) -> str:
+        if not self.hidden_events:
+            return ""
+        count = self.hidden_events
+        self.hidden_events = 0
+        return f"codex activity: {count} hidden tool/status events\n"
+
+    def visible(self, text: str) -> str:
+        self.last_visible = time.monotonic()
+        return text
+
+
+class ClaudeStreamDisplay:
+    def __init__(self, *, activity_seconds: int = 20) -> None:
+        self.activity_seconds = activity_seconds
+        self.hidden_events = 0
+        self.last_visible = time.monotonic()
+        self.started = False
+
+    def __call__(self, name: str, line: str) -> str | None:
+        if name != "stdout":
+            return line
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return self.visible(line)
+        event_type = event.get("type")
+        if event_type == "system" and not self.started:
+            self.started = True
+            return self.visible("claude turn started\n")
+        if event_type == "assistant":
+            return self.assistant_message(event)
+        if event_type == "result":
+            return self.visible(self.flush_hidden() + self.result_summary(event))
+        return self.hidden_activity()
+
+    def assistant_message(self, event: dict[str, Any]) -> str | None:
+        message = event.get("message")
+        if not isinstance(message, dict):
+            return self.hidden_activity()
+        chunks: list[str] = []
+        for item in message.get("content", []):
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and isinstance(item.get("text"), str):
+                chunks.append(item["text"].rstrip())
+        if chunks:
+            return self.visible(self.flush_hidden() + "\n".join(chunks) + "\n")
+        return self.hidden_activity()
+
+    def result_summary(self, event: dict[str, Any]) -> str:
+        usage = event.get("usage")
+        fields: list[str] = []
+        if isinstance(usage, dict):
+            for key in (
+                "input_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+                "output_tokens",
+            ):
+                value = usage.get(key)
+                if isinstance(value, int):
+                    fields.append(f"{key}={value}")
+        cost = event.get("total_cost_usd")
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            fields.append(f"cost_usd={cost:.6f}")
+        return "claude usage: " + " ".join(fields) + "\n" if fields else "claude turn completed\n"
+
+    def hidden_activity(self) -> str | None:
+        self.hidden_events += 1
+        if time.monotonic() - self.last_visible < self.activity_seconds:
+            return None
+        return self.visible(self.flush_hidden())
+
+    def flush_hidden(self) -> str:
+        if not self.hidden_events:
+            return ""
+        count = self.hidden_events
+        self.hidden_events = 0
+        return f"claude activity: {count} hidden tool/status events\n"
+
+    def visible(self, text: str) -> str:
+        self.last_visible = time.monotonic()
+        return text
+
+
+def format_codex_usage(usage: dict[str, Any]) -> str:
+    fields = [
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+    ]
+    parts = [f"{field}={usage[field]}" for field in fields if isinstance(usage.get(field), int)]
+    return "codex usage: " + " ".join(parts) if parts else "codex usage: unavailable"
+
+
+def claude_allowed_tools(args: argparse.Namespace) -> str:
+    tools = [tool.strip() for tool in args.claude_allowed_tools.split(",") if tool.strip()]
+    unsupported = sorted(set(tools) - CLAUDE_READ_ONLY_TOOLS)
+    if unsupported:
+        valid = ", ".join(sorted(CLAUDE_READ_ONLY_TOOLS))
+        raise SystemExit(f"unsupported Claude review tool(s): {', '.join(unsupported)}. Allowed read-only tools: {valid}")
+    if not args.web_search:
+        tools = [tool for tool in tools if tool not in CLAUDE_WEB_TOOLS]
+    return ",".join(tools)
+
+
+def claude_env(args: argparse.Namespace) -> dict[str, str]:
+    env, root = isolated_env_root(args, "claude")
+    config = root / "config"
+    (config / "settings.json").write_text("{}\n")
+    env["CLAUDE_CONFIG_DIR"] = str(config)
+    env["CLAUDE_CODE_SETTINGS_PATH"] = str(config / "settings.json")
+    return env
+
+
+def isolated_env_root(args: argparse.Namespace, name: str) -> tuple[dict[str, str], Path]:
+    env = minimal_env()
+    root = helper_temp_dir(args) / f"{name}-isolated"
+    home = root / "home"
+    xdg = root / "xdg"
+    config = root / "config"
+    temp = root / "tmp"
+    codex_home = root / "codex-home"
+    home.mkdir(parents=True, exist_ok=True)
+    xdg.mkdir(parents=True, exist_ok=True)
+    config.mkdir(parents=True, exist_ok=True)
+    temp.mkdir(parents=True, exist_ok=True)
+    codex_home.mkdir(parents=True, exist_ok=True)
+    env["HOME"] = str(home)
+    env["XDG_CONFIG_HOME"] = str(xdg)
+    env["TMPDIR"] = str(temp)
+    env["TEMP"] = str(temp)
+    env["TMP"] = str(temp)
+    env["PATH"] = sanitized_path_env(command_reject_roots(args))
+    if name == "codex":
+        env["CODEX_HOME"] = str(codex_home)
+    for key in ENGINE_ENV_KEYS.get(name, set()):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    return env, root
+
+
+def isolated_engine_env(args: argparse.Namespace, name: str) -> dict[str, str]:
+    env, _ = isolated_env_root(args, name)
+    return env
+
+
+def minimal_env() -> dict[str, str]:
+    keep = {
+        "PATH",
+        "SystemRoot",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
+    }
+    return {key: value for key, value in os.environ.items() if key in keep}
+
+
+def sanitized_path_env(reject_roots: Iterable[Path]) -> str:
+    roots = resolved_reject_roots(Path.cwd(), reject_roots)
+    kept: list[str] = []
+    seen: set[Path] = set()
+    for part in os.environ.get("PATH", "").split(os.pathsep):
+        if not part or part == ".":
+            continue
+        path = Path(part)
+        if not path.is_absolute():
+            continue
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved in seen or is_within_any(resolved, roots):
+            continue
+        seen.add(resolved)
+        kept.append(str(resolved))
+    return os.pathsep.join(kept)
+
+
+def extract_json(text: str) -> dict[str, Any]:
+    stripped = text.strip()
+    if not stripped:
+        raise SystemExit("review engine returned empty output")
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        fenced_report = parse_json_candidate(stripped)
+        if isinstance(fenced_report, dict) and "findings" in fenced_report:
+            return fenced_report
+        jsonl_report = extract_json_from_jsonl(stripped)
+        if jsonl_report:
+            return jsonl_report
+        raise SystemExit(f"review engine returned non-JSON output: {exc}; output {text_summary(stripped)}")
+    if isinstance(parsed, dict) and "findings" in parsed:
+        return parsed
+    if isinstance(parsed, dict) and isinstance(parsed.get("structured_output"), dict):
+        return parsed["structured_output"]
+    if isinstance(parsed, dict) and isinstance(parsed.get("result"), str):
+        result_json = parse_json_candidate(parsed["result"])
+        if isinstance(result_json, dict) and "findings" in result_json:
+            return result_json
+        raise SystemExit(f"review engine result was not structured JSON; result {text_summary(parsed['result'])}")
+    jsonl_report = extract_json_from_jsonl(stripped)
+    if jsonl_report:
+        return jsonl_report
+    raise SystemExit(f"review engine returned unexpected JSON shape: {json_shape_summary(parsed)}; output {text_summary(stripped)}")
+
+
+def extract_json_from_jsonl(text: str) -> dict[str, Any] | None:
+    candidates: list[str | dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        part = event.get("part")
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            candidates.append(part["text"])
+        data = event.get("data")
+        if isinstance(data, dict) and isinstance(data.get("content"), str):
+            candidates.append(data["content"])
+        if isinstance(event.get("result"), str):
+            candidates.append(event["result"])
+        if isinstance(event.get("structured_output"), dict):
+            candidates.append(event["structured_output"])
+    for candidate in reversed(candidates):
+        if isinstance(candidate, dict):
+            if "findings" in candidate:
+                return candidate
+            continue
+        parsed = parse_json_candidate(candidate)
+        if isinstance(parsed, dict) and "findings" in parsed:
+            return parsed
+    return None
+
+
+def normalize_report_path(raw: str, changed_paths: set[str] | None = None) -> str:
+    candidate = raw.strip().replace("\\", "/")
+    if not candidate:
+        raise ValueError("empty path")
+    if candidate.startswith("/") or (len(candidate) >= 2 and candidate[1] == ":"):
+        raise ValueError("absolute path")
+    parts: list[str] = []
+    for part in candidate.split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            raise ValueError("parent directory reference")
+        parts.append(part)
+    if not parts:
+        raise ValueError("empty path")
+    normalized = "/".join(parts)
+    if len(parts) > 1 and parts[0] in {"a", "b"}:
+        stripped = "/".join(parts[1:])
+        if changed_paths is None:
+            return stripped
+        if normalized in changed_paths:
+            return normalized
+        if stripped in changed_paths:
+            return stripped
+    return normalized
+
+
+def parse_json_candidate(text: str) -> Any | None:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines and lines[0].startswith("```") and lines[-1].strip() == "```":
+            stripped = "\n".join(lines[1:-1]).strip()
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed, str) and parsed != text:
+        nested = parse_json_candidate(parsed)
+        return nested if nested is not None else parsed
+    return parsed
+
+
+def validate_report(
+    report: dict[str, Any],
+    repo: Path,
+    changed_paths: set[str],
+    required: list[str],
+    line_counts: dict[str, int] | None = None,
+) -> None:
+    metadata = {key: report.pop(key) for key in list(report) if key.startswith("_autoreview_")}
+    allowed_top = {"findings", "overall_correctness", "overall_explanation", "overall_confidence"}
+    extra_top = set(report) - allowed_top
+    if extra_top:
+        raise SystemExit(f"review JSON has unexpected top-level keys: {sorted(extra_top)}")
+    for key in SCHEMA["required"]:
+        if key not in report:
+            raise SystemExit(f"review JSON missing required key: {key}")
+    if not isinstance(report["findings"], list):
+        raise SystemExit("review JSON findings must be an array")
+    if report.get("overall_correctness") not in {"patch is correct", "patch is incorrect"}:
+        raise SystemExit(f"review JSON has invalid overall_correctness: {report.get('overall_correctness')}")
+    if not isinstance(report.get("overall_explanation"), str) or not report["overall_explanation"]:
+        raise SystemExit("review JSON overall_explanation must be a non-empty string")
+    if len(report["overall_explanation"]) > 3000:
+        raise SystemExit("review JSON overall_explanation is too long")
+    if not number_in_range(report.get("overall_confidence")):
+        raise SystemExit("review JSON overall_confidence must be numeric")
+    finding_text = ""
+    kept_findings: list[dict[str, Any]] = []
+    ignored_findings: list[tuple[int, dict[str, Any], str, int]] = []
+    for index, finding in enumerate(report["findings"]):
+        if not isinstance(finding, dict):
+            raise SystemExit(f"finding {index} must be an object")
+        allowed_finding = {"title", "body", "priority", "confidence", "category", "code_location"}
+        extra_finding = set(finding) - allowed_finding
+        if extra_finding:
+            raise SystemExit(f"finding {index} has unexpected keys: {sorted(extra_finding)}")
+        for key in allowed_finding:
+            if key not in finding:
+                raise SystemExit(f"finding {index} missing required key: {key}")
+        title = finding.get("title")
+        if not isinstance(title, str) or not title or len(title) > 140:
+            raise SystemExit(f"finding {index} has invalid title")
+        body = finding.get("body")
+        if not isinstance(body, str) or not body or len(body) > 2000:
+            raise SystemExit(f"finding {index} has invalid body")
+        priority = finding.get("priority")
+        if priority not in {"P0", "P1", "P2", "P3"}:
+            raise SystemExit(f"finding {index} has invalid priority: {priority}")
+        if not number_in_range(finding.get("confidence")):
+            raise SystemExit(f"finding {index} has invalid confidence")
+        category = finding.get("category")
+        if category not in {"bug", "security", "regression", "test_gap", "maintainability"}:
+            raise SystemExit(f"finding {index} has invalid category: {category}")
+        location = finding.get("code_location")
+        if not isinstance(location, dict):
+            raise SystemExit(f"finding {index} missing code_location")
+        raw_rel = str(location.get("file_path", "")).strip()
+        line = location.get("line")
+        if not raw_rel or not isinstance(line, int) or line < 1:
+            raise SystemExit(f"finding {index} has invalid location: {location}")
+        try:
+            rel = normalize_report_path(raw_rel, changed_paths)
+        except ValueError as exc:
+            raise SystemExit(f"finding {index} uses invalid file path: {raw_rel} ({exc})") from exc
+        finding["code_location"]["file_path"] = rel
+        if rel not in changed_paths:
+            ignored_findings.append((index, finding, rel, line))
+            continue
+        if line_counts is not None and rel in line_counts and line > line_counts[rel]:
+            raise SystemExit(f"finding {index} cites line {line} beyond {rel} line count {line_counts[rel]}")
+        kept_findings.append(finding)
+        finding_text += "\n" + json.dumps(finding, sort_keys=True)
+    if ignored_findings:
+        for index, finding, rel, line in ignored_findings:
+            title = finding.get("title", "<untitled>")
+            print(
+                f"autoreview ignored out-of-scope finding {index}: {title} ({rel}:{line})",
+                file=sys.stderr,
+            )
+            print(bounded_field(str(finding.get("body", "")), 500), file=sys.stderr)
+        report["findings"] = kept_findings
+        if not kept_findings and report["overall_correctness"] == "patch is incorrect":
+            note = f"Ignored {len(ignored_findings)} out-of-scope finding(s) outside the reviewed change."
+            explanation = report["overall_explanation"].rstrip()
+            report["overall_correctness"] = "patch is correct"
+            report["overall_explanation"] = bounded_field(f"{explanation}\n\n{note}", 3000)
+    report["_autoreview_triage"] = {
+        "accepted": len(kept_findings),
+        "rejected": len(ignored_findings) + int(metadata.get("_autoreview_rejected", 0)),
+        "duplicates": int(metadata.get("_autoreview_duplicates", 0)),
+        "needs_more_evidence": int(metadata.get("_autoreview_needs_more_evidence", 0)),
+    }
+    haystack = finding_text.lower()
+    for needle in required:
+        if needle.lower() not in haystack:
+            raise SystemExit(f"required finding text not found: {needle}")
+
+
+def number_in_range(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1
+
+
+def print_report(report: dict[str, Any], *, label: str = "autoreview", file: Any = None) -> None:
+    if file is None:
+        file = sys.stdout
+    findings = report["findings"]
+    if findings:
+        print(f"{label} findings: {len(findings)}", file=file)
+    elif report["overall_correctness"] == "patch is incorrect":
+        print(f"{label} verdict: patch is incorrect without discrete findings", file=file)
+    else:
+        print(f"{label} clean: no accepted/actionable findings reported", file=file)
+    for finding in findings:
+        loc = finding["code_location"]
+        print(f"[{finding['priority']}] {finding['title']}", file=file)
+        print(f"{loc['file_path']}:{loc['line']}", file=file)
+        print(f"{finding['body']}", file=file)
+        print(file=file)
+    print(f"overall: {report['overall_correctness']} ({report['overall_confidence']})", file=file)
+    print(report["overall_explanation"], file=file)
+
+
+def triage_status_lines(report: dict[str, Any]) -> list[str]:
+    triage = report.get("_autoreview_triage", {})
+    accepted = int(triage.get("accepted", len(report["findings"]))) if isinstance(triage, dict) else len(report["findings"])
+    rejected = int(triage.get("rejected", 0)) if isinstance(triage, dict) else 0
+    duplicates = int(triage.get("duplicates", 0)) if isinstance(triage, dict) else 0
+    needs_more_evidence = int(triage.get("needs_more_evidence", 0)) if isinstance(triage, dict) else 0
+    verdict_without_discrete_findings = report["overall_correctness"] == "patch is incorrect" and accepted == 0
+    lines = [
+        "triage_mode: helper_phase2_validated_findings",
+        f"triage_accepted_findings: {accepted}",
+        f"triage_rejected_findings: {rejected}",
+        f"triage_duplicate_findings: {duplicates}",
+        f"triage_needs_more_evidence_findings: {needs_more_evidence}",
+    ]
+    if verdict_without_discrete_findings:
+        lines.append("triage_note: overall verdict is incorrect without discrete accepted findings")
+    return lines
+
+
+class ParallelTestsMonitor:
+    def __init__(self, proc: subprocess.Popen, started: float, timeout_seconds: int) -> None:
+        self.proc = proc
+        self.started = started
+        self.timeout_seconds = timeout_seconds
+        self.status: int | None = None
+        self.thread = threading.Thread(target=self._monitor, name="autoreview-parallel-tests-watchdog", daemon=True)
+        self.thread.start()
+
+    def _timeout(self) -> int:
+        message = timeout_message("parallel tests", self.timeout_seconds, self.started, self.proc.pid)
+        print(message, file=sys.stderr, flush=True)
+        terminate_process_group(self.proc)
+        try:
+            self.proc.wait(timeout=PROCESS_TERMINATE_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            terminate_process_group(self.proc, force=True)
+            self.proc.wait()
+        print(f"tests exit: {TIMEOUT_RETURN_CODE} after {int(time.monotonic() - self.started)}s")
+        return TIMEOUT_RETURN_CODE
+
+    def _monitor(self) -> None:
+        deadline = self.started + self.timeout_seconds
+        while self.proc.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.status = self._timeout()
+                return
+            try:
+                self.proc.wait(timeout=max(0.001, min(60.0, remaining)))
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline:
+                    self.status = self._timeout()
+                    return
+                elapsed = int(time.monotonic() - self.started)
+                print(f"tests still running: elapsed={elapsed}s pid={self.proc.pid}", file=sys.stderr, flush=True)
+        self.status = int(self.proc.returncode or 0)
+        print(f"tests exit: {self.status} after {int(time.monotonic() - self.started)}s")
+
+    def finish(self) -> int:
+        self.thread.join()
+        if self.status is not None:
+            return self.status
+        return int(self.proc.returncode or 0)
+
+
+def start_parallel_tests(command: str, repo: Path, shell_kind: str, timeout_seconds: int) -> ParallelTestsMonitor:
+    print(f"tests: {command_summary(command)}")
+    if shell_kind == "default" or shell_kind == "cmd":
+        proc = subprocess.Popen(command, cwd=repo, shell=True, **process_group_kwargs())
+        return ParallelTestsMonitor(proc, time.monotonic(), timeout_seconds)
+    if shell_kind == "powershell":
+        powershell = resolve_command("powershell", repo)
+        proc = subprocess.Popen(
+            [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            cwd=repo,
+            **process_group_kwargs(),
+        )
+        return ParallelTestsMonitor(proc, time.monotonic(), timeout_seconds)
+    if shell_kind == "pwsh":
+        pwsh = resolve_command("pwsh", repo)
+        proc = subprocess.Popen(
+            [pwsh, "-NoProfile", "-Command", command],
+            cwd=repo,
+            **process_group_kwargs(),
+        )
+        return ParallelTestsMonitor(proc, time.monotonic(), timeout_seconds)
+    raise SystemExit(f"invalid --parallel-tests-shell/AUTOREVIEW_PARALLEL_TESTS_SHELL: {shell_kind}")
+
+
+def finish_parallel_tests(monitor: ParallelTestsMonitor) -> int:
+    return monitor.finish()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Bundle-driven AI code review.")
+    parser.add_argument("--mode", choices=["auto", "local", "uncommitted", "branch", "commit", "bundle"], default="auto")
+    parser.add_argument("--target", help="Explicit file, directory, or frozen review bundle target for --mode bundle.")
+    parser.add_argument(
+        "--bundle-max-files",
+        type=positive_int,
+        default=DEFAULT_BUNDLE_MAX_FILES,
+        help=f"Maximum files allowed in --mode bundle preflight before reviewers run. Default: {DEFAULT_BUNDLE_MAX_FILES}.",
+    )
+    parser.add_argument(
+        "--bundle-max-total-bytes",
+        type=positive_int,
+        default=DEFAULT_BUNDLE_MAX_TOTAL_BYTES,
+        help=(
+            "Maximum source bytes allowed in --mode bundle preflight before reviewers run. "
+            f"Default: {DEFAULT_BUNDLE_MAX_TOTAL_BYTES}."
+        ),
+    )
+    parser.add_argument(
+        "--bundle-max-prompt-chars",
+        type=positive_int,
+        default=DEFAULT_BUNDLE_MAX_PROMPT_CHARS,
+        help=(
+            "Maximum final prompt characters allowed for --mode bundle before reviewers run. "
+            f"Default: {DEFAULT_BUNDLE_MAX_PROMPT_CHARS}."
+        ),
+    )
+    parser.add_argument(
+        "--allow-large-bundle",
+        action="store_true",
+        help="Explicitly bypass --mode bundle max-files, max-total-bytes, and max-prompt-chars preflight limits.",
+    )
+    parser.add_argument(
+        "--include-generated",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--exclude-generated",
+        action="store_true",
+        help="For --mode bundle directory targets, exclude generated/dependency/build/cache files from the frozen bundle.",
+    )
+    parser.add_argument("--base")
+    parser.add_argument("--commit", default="HEAD")
+    parser.add_argument("--engine", choices=ENGINES, default=os.environ.get("AUTOREVIEW_ENGINE", "codex"))
+    parser.add_argument("--reviewers", help="Comma-separated review panel, e.g. codex,claude or codex:gpt-5:high.")
+    parser.add_argument("--panel", action="store_true", help="Run a Codex/Claude review panel unless --engine changes the first reviewer.")
+    parser.add_argument("--model", action="append", help="Model for all reviewers or engine=model. Repeatable.")
+    parser.add_argument("--thinking", action="append", help="Thinking/effort for all reviewers or engine=level. Repeatable. Codex: low, medium, high, xhigh. Claude: low, medium, high, xhigh, max.")
+    parser.add_argument("--allow-partial-panel", action="store_true", help="Continue panel output when one reviewer fails.")
+    parser.add_argument("--codex-bin", default=os.environ.get("CODEX_BIN", "codex"))
+    parser.add_argument("--claude-bin", default=os.environ.get("CLAUDE_BIN", "claude"))
+    parser.add_argument("--droid-bin", default=os.environ.get("DROID_BIN", "droid"))
+    parser.add_argument("--copilot-bin", default=os.environ.get("COPILOT_BIN", "copilot"))
+    parser.add_argument(
+        "--engine-timeout-seconds",
+        type=positive_int,
+        default=DEFAULT_ENGINE_TIMEOUT_SECONDS,
+        help=f"Hard timeout for each review engine process. Default: {DEFAULT_ENGINE_TIMEOUT_SECONDS}.",
+    )
+    parser.add_argument("--no-tools", dest="tools", action="store_false", default=True, help="Disable tools for engines that support it. Codex and copilot reject no-tools review.")
+    parser.add_argument("--web-search", dest="web_search", action="store_true", default=False, help="Enable reviewer web search/web fetch tools; off by default.")
+    parser.add_argument("--no-web-search", dest="web_search", action="store_false", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--allow-prompt-only-engines",
+        action="store_true",
+        help="Allow reviewer engines whose nested-workflow/network constraints cannot be hard-enforced; labels the run degraded.",
+    )
+    parser.add_argument(
+        "--claude-allowed-tools",
+        default=os.environ.get(
+            "AUTOREVIEW_CLAUDE_TOOLS",
+            "Read,Grep,Glob,WebSearch,WebFetch",
+        ),
+    )
+    parser.add_argument("--prompt", action="append", help="Additional review instruction text.")
+    parser.add_argument("--prompt-file", action="append", help="Additional review instruction file.")
+    parser.add_argument("--dataset", action="append", help="Extra evidence file to include in the review bundle.")
+    parser.add_argument("--output", help="Write human output to a file as well as stdout.")
+    parser.add_argument("--json-output", help="Write validated structured review JSON.")
+    parser.add_argument(
+        "--stream-engine-output",
+        action="store_true",
+        default=os.environ.get("AUTOREVIEW_STREAM_ENGINE_OUTPUT") == "1",
+        help="Stream review engine output while preserving buffered output for validation. Codex output is filtered to hide tool/file chatter.",
+    )
+    parser.add_argument("--parallel-tests", help="Run a test command concurrently with git-mode review; not allowed with --mode bundle.")
+    parser.add_argument(
+        "--parallel-tests-timeout-seconds",
+        type=positive_int,
+        default=DEFAULT_PARALLEL_TESTS_TIMEOUT_SECONDS,
+        help=(
+            "Hard timeout for --parallel-tests measured from test process start. "
+            f"Default: {DEFAULT_PARALLEL_TESTS_TIMEOUT_SECONDS}."
+        ),
+    )
+    parser.add_argument(
+        "--parallel-tests-shell",
+        choices=["default", "cmd", "powershell", "pwsh"],
+        default=os.environ.get("AUTOREVIEW_PARALLEL_TESTS_SHELL", "default"),
+        help="Shell for --parallel-tests. Default preserves Python shell=True platform behavior; use powershell or pwsh for PowerShell-specific commands.",
+    )
+    parser.add_argument("--require-finding", action="append", default=[], help="Require finding text to contain this substring.")
+    parser.add_argument("--expect-findings", action="store_true", help="Treat findings as success; for harness acceptance tests.")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    if args.engine not in ENGINES:
+        raise SystemExit(f"invalid --engine/AUTOREVIEW_ENGINE: {args.engine}")
+    return args
+
+
+def run_engine(args: argparse.Namespace, repo: Path, prompt: str) -> str:
+    if args.engine == "codex":
+        return run_codex(args, repo, prompt)
+    if args.engine == "claude":
+        return run_claude(args, repo, prompt)
+    if args.engine == "droid":
+        return run_droid(args, repo, prompt)
+    if args.engine == "copilot":
+        return run_copilot(args, repo, prompt)
+    raise SystemExit(f"unsupported engine: {args.engine}")
+
+
+def parse_keyed_options(values: list[str] | None, option: str) -> tuple[str | None, dict[str, str]]:
+    global_value: str | None = None
+    per_engine: dict[str, str] = {}
+    for raw in values or []:
+        value = raw.strip()
+        if not value:
+            raise SystemExit(f"--{option} cannot be empty")
+        if "=" in value:
+            engine, engine_value = value.split("=", 1)
+            engine = engine.strip()
+            engine_value = engine_value.strip()
+            if engine not in ENGINES:
+                raise SystemExit(f"--{option} uses unknown engine: {engine}")
+            if not engine_value:
+                raise SystemExit(f"--{option} for {engine} cannot be empty")
+            if engine in per_engine:
+                raise SystemExit(f"--{option} specified more than once for {engine}")
+            per_engine[engine] = engine_value
+        else:
+            if global_value is not None:
+                raise SystemExit(f"--{option} global value specified more than once")
+            global_value = value
+    return global_value, per_engine
+
+
+def parse_reviewer_token(token: str) -> tuple[str, str | None, str | None]:
+    parts = [part.strip() for part in token.split(":")]
+    if len(parts) > 3 or not parts[0]:
+        raise SystemExit(f"invalid reviewer spec: {token}")
+    engine = parts[0]
+    if engine not in ENGINES:
+        raise SystemExit(f"unknown reviewer engine: {engine}")
+    model = parts[1] if len(parts) >= 2 and parts[1] else None
+    thinking = parts[2] if len(parts) == 3 and parts[2] else None
+    return engine, model, thinking
+
+
+def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
+    global_model, model_by_engine = parse_keyed_options(args.model, "model")
+    global_thinking, thinking_by_engine = parse_keyed_options(args.thinking, "thinking")
+    reviewers: list[tuple[str, str | None, str | None]] = []
+    if args.reviewers:
+        tokens = [token.strip() for token in args.reviewers.split(",") if token.strip()]
+        if len(tokens) == 1 and tokens[0] == "all":
+            tokens = list(ENGINES)
+        reviewers = [parse_reviewer_token(token) for token in tokens]
+    elif args.panel:
+        engines = [args.engine]
+        for engine in ("codex", "claude"):
+            if engine not in engines:
+                engines.append(engine)
+        reviewers = [(engine, None, None) for engine in engines]
+    else:
+        reviewers = [(args.engine, None, None)]
+
+    seen: set[str] = set()
+    result: list[argparse.Namespace] = []
+    for engine, inline_model, inline_thinking in reviewers:
+        if engine in seen:
+            raise SystemExit(f"reviewer specified more than once: {engine}")
+        seen.add(engine)
+        model = inline_model or model_by_engine.get(engine) or global_model
+        thinking = inline_thinking or thinking_by_engine.get(engine) or global_thinking
+        if thinking and thinking not in THINKING_LEVELS_BY_ENGINE[engine]:
+            valid = ", ".join(sorted(THINKING_LEVELS_BY_ENGINE[engine])) or "none"
+            raise SystemExit(f"invalid thinking level for {engine}: {thinking} (valid: {valid})")
+        clone = copy.copy(args)
+        clone.engine = engine
+        clone.model = model
+        clone.thinking = thinking
+        result.append(clone)
+    return result
+
+
+def reviewer_label(args: argparse.Namespace) -> str:
+    parts = [args.engine]
+    if args.model:
+        parts.append(f"model={args.model}")
+    if args.thinking:
+        parts.append(f"thinking={args.thinking}")
+    return " ".join(parts)
+
+
+def prompt_only_reviewers(reviewers: list[argparse.Namespace]) -> list[str]:
+    return [reviewer_label(reviewer) for reviewer in reviewers if reviewer.engine == "codex"]
+
+
+def validate_reviewer_enforcement(args: argparse.Namespace, reviewers: list[argparse.Namespace]) -> None:
+    prompt_only = prompt_only_reviewers(reviewers)
+    if prompt_only and not args.allow_prompt_only_engines:
+        raise SystemExit(
+            "reviewer engine(s) lack hard enforcement for shell/network/nested-workflow bans: "
+            + ", ".join(prompt_only)
+            + ". Use a stricter engine or pass --allow-prompt-only-engines for an explicitly degraded helper run."
+        )
+
+
+def run_degraded_reasons(args: argparse.Namespace, reviewers: list[argparse.Namespace]) -> list[str]:
+    reasons: list[str] = []
+    prompt_only = prompt_only_reviewers(reviewers)
+    if prompt_only and args.allow_prompt_only_engines:
+        reasons.append(f"prompt-only engine enforcement: {', '.join(prompt_only)}")
+    if len(reviewers) == 1:
+        reasons.append("single-engine helper fallback")
+    if any(reviewer.engine == "droid" for reviewer in reviewers):
+        reasons.append("droid no-tools prompt-bundle-only coverage")
+    if args.web_search:
+        reasons.append("web-search privacy constraints are prompt-enforced")
+    reasons.append("helper-only Phase 2 triage: validated in-scope findings are accepted without independent triage agents")
+    return reasons
+
+
+def run_reviewer(
+    args: argparse.Namespace,
+    repo: Path,
+    prompt: str,
+    changed_paths: set[str],
+    required: list[str],
+    line_counts: dict[str, int],
+) -> dict[str, Any]:
+    raw = run_engine(args, repo, prompt)
+    report = extract_json(raw)
+    validate_report(report, repo, changed_paths, required, line_counts)
+    return report
+
+
+def merge_panel_reports(reports: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
+    findings: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, str, str]] = set()
+    duplicates = 0
+    rejected = 0
+    needs_more_evidence = 0
+    for label, report in reports:
+        triage = report.get("_autoreview_triage", {})
+        if isinstance(triage, dict):
+            rejected += int(triage.get("rejected", 0))
+            needs_more_evidence += int(triage.get("needs_more_evidence", 0))
+        for finding in report["findings"]:
+            location = finding["code_location"]
+            key = (
+                location["file_path"],
+                location["line"],
+                finding["category"],
+                " ".join(finding["title"].lower().split()),
+            )
+            if key in seen:
+                duplicates += 1
+                continue
+            seen.add(key)
+            merged = copy.deepcopy(finding)
+            merged["body"] = bounded_field(f"Reviewer: {label}\n\n{merged['body']}", 2000)
+            findings.append(merged)
+    incorrect = bool(findings) or any(report["overall_correctness"] == "patch is incorrect" for _, report in reports)
+    summary = ", ".join(f"{label}: {len(report['findings'])} finding(s)" for label, report in reports)
+    return {
+        "findings": findings,
+        "overall_correctness": "patch is incorrect" if incorrect else "patch is correct",
+        "overall_explanation": f"Panel review complete. {summary}.",
+        "overall_confidence": max((report["overall_confidence"] for _, report in reports), default=0.5),
+        "_autoreview_duplicates": duplicates,
+        "_autoreview_rejected": rejected,
+        "_autoreview_needs_more_evidence": needs_more_evidence,
+    }
+
+
+def run_panel(
+    args: argparse.Namespace,
+    reviewers: list[argparse.Namespace],
+    repo: Path,
+    prompt: str,
+    changed_paths: set[str],
+    line_counts: dict[str, int],
+) -> dict[str, Any]:
+    reports: list[tuple[str, dict[str, Any]]] = []
+    failures: list[str] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(reviewers)) as executor:
+        future_by_label = {
+            executor.submit(run_reviewer, reviewer, repo, prompt, changed_paths, [], line_counts): reviewer_label(reviewer)
+            for reviewer in reviewers
+        }
+        for future in concurrent.futures.as_completed(future_by_label):
+            label = future_by_label[future]
+            try:
+                reports.append((label, future.result()))
+            except SystemExit as exc:
+                failures.append(f"{label}: {exc}")
+            except Exception as exc:
+                failures.append(f"{label}: {exc}")
+    if failures and not args.allow_partial_panel:
+        raise SystemExit("autoreview panel failed\n" + "\n".join(failures))
+    degraded_reasons: list[str] = []
+    if len(reviewers) < len(ENGINES):
+        degraded_reasons.append(
+            f"partial reviewer coverage: {len(reviewers)}/{len(ENGINES)} engines ({', '.join(reviewer_label(reviewer) for reviewer in reviewers)})"
+        )
+    if failures:
+        degraded_reasons.append(f"reviewer failures: {'; '.join(failures)}")
+    global_reasons = set(run_degraded_reasons(args, reviewers))
+    args.panel_degraded_reasons = [reason for reason in degraded_reasons if reason not in global_reasons]
+    args.panel_failures = failures
+    if failures:
+        for failure in failures:
+            print(f"panel reviewer failed: {failure}")
+    if not reports:
+        raise SystemExit("autoreview panel produced no reports")
+    reports.sort(key=lambda item: item[0])
+    report = merge_panel_reports(reports)
+    report_degraded_reasons = [*degraded_reasons, *global_reasons]
+    if report_degraded_reasons:
+        report["overall_explanation"] = bounded_field(
+            f"Degraded panel coverage: {'; '.join(dict.fromkeys(report_degraded_reasons))}\n\n{report['overall_explanation']}",
+            3000,
+        )
+    validate_report(report, repo, changed_paths, args.require_finding, line_counts)
+    return report
+
+
+def bundle_target_context(raw_target: str | None) -> tuple[Path, str]:
+    if not raw_target:
+        raise SystemExit("--mode bundle requires --target <path>")
+    target_path = Path(raw_target).expanduser().resolve()
+    if not target_path.exists():
+        raise SystemExit(f"bundle target not found: {target_path}")
+    execution_root = target_path if target_path.is_dir() else target_path.parent
+    return execution_root, str(target_path)
+
+
+def freeze_bundle_execution_root(target_ref: str, *, include_generated: bool) -> tuple[Path, str, list[str]]:
+    target_path = Path(target_ref).resolve()
+    execution_root = safe_mkdtemp("autoreview-bundle-root.", target_path)
+    files, directories, excluded = iter_content_bundle_entries(target_path, include_generated=include_generated)
+    if target_path.is_file():
+        destination = execution_root / target_path.name
+        copy_regular_file_no_follow(target_path, destination)
+        make_tree_read_only(execution_root)
+        return execution_root, str(destination), excluded
+    for directory in directories:
+        rel = directory.relative_to(target_path)
+        destination = execution_root / rel
+        destination.mkdir(parents=True, exist_ok=True)
+        os.chmod(destination, stat.S_IMODE(directory.stat().st_mode))
+    for path in files:
+        stats = ancestor_stats(path, target_path)
+        rel = path.relative_to(target_path)
+        destination = execution_root / rel
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        verify_ancestor_stats(stats)
+        copy_regular_file_no_follow(path, destination)
+    make_tree_read_only(execution_root)
+    return execution_root, str(execution_root), excluded
+
+
+def format_command(argv: list[str]) -> str:
+    return " ".join(shlex.quote(arg) for arg in argv)
+
+
+def sanitized_argv(argv: list[str]) -> list[str]:
+    sanitized: list[str] = []
+    redact_next = False
+    for index, arg in enumerate(argv):
+        if index == 0:
+            sanitized.append(Path(arg).name or arg)
+            continue
+        if redact_next:
+            sanitized.append("<redacted>")
+            redact_next = False
+            continue
+        matched_inline = False
+        for option in REDACTED_COMMAND_OPTIONS:
+            prefix = option + "="
+            if arg.startswith(prefix):
+                sanitized.append(f"{option}=<redacted>")
+                matched_inline = True
+                break
+        if matched_inline:
+            continue
+        sanitized.append(arg)
+        if arg in REDACTED_COMMAND_OPTIONS:
+            redact_next = True
+    return sanitized
+
+
+def output_destinations(args: argparse.Namespace) -> list[tuple[str, Path]]:
+    paths: list[tuple[str, Path]] = []
+    if args.output:
+        paths.append(("--output", Path(args.output).expanduser().resolve()))
+    if args.json_output:
+        paths.append(("--json-output", Path(args.json_output).expanduser().resolve()))
+    return paths
+
+
+def resolved_output_path(args: argparse.Namespace, option: str) -> Path:
+    for candidate_option, path in output_destinations(args):
+        if candidate_option == option:
+            return path
+    raise SystemExit(f"{option} path was not configured")
+
+
+def output_would_mutate_target(path: Path, repo: Path, target: str, target_ref: str | None) -> bool:
+    if target == "bundle":
+        assert target_ref
+        protected = Path(target_ref).expanduser().resolve()
+        if protected.is_dir():
+            return is_within(path, protected)
+        return path == protected
+    return is_within(path, repo.resolve())
+
+
+def validate_output_destinations(args: argparse.Namespace, repo: Path, target: str, target_ref: str | None) -> None:
+    destinations = output_destinations(args)
+    resolved_paths = [path for _, path in destinations]
+    if len(set(resolved_paths)) != len(resolved_paths):
+        raise SystemExit("--output and --json-output must use distinct paths")
+    for option, path in destinations:
+        if output_would_mutate_target(path, repo, target, target_ref):
+            raise SystemExit(f"{option} must be outside the reviewed target to preserve the stale guard: {path}")
+
+
+def main() -> int:
+    args = parse_args()
+    reviewers = reviewer_args(args)
+    include_generated = True if args.include_generated else not args.exclude_generated
+    status_lines: list[str] = []
+
+    def emit(line: str) -> None:
+        status_lines.append(line)
+        print(line)
+
+    if args.target and args.mode != "bundle":
+        raise SystemExit("--target is only supported with --mode bundle")
+    if args.mode == "bundle":
+        repo, target_ref = bundle_target_context(args.target)
+        target = "bundle"
+        branch = "n/a"
+    else:
+        repo = repo_root()
+        target, target_ref = choose_target(repo, args.mode, args.base)
+        branch = current_branch(repo)
+    original_command_root = repo.resolve()
+    bundle_stats: dict[str, int] | None = None
+    if target == "branch":
+        assert target_ref
+        validate_git_ref(target_ref, "--base")
+        enforce_clean_ref_review(repo, target)
+    if target == "commit":
+        validate_git_ref(args.commit, "--commit")
+        enforce_head_commit(repo, args.commit)
+        enforce_clean_ref_review(repo, target)
+    if target == "bundle" and args.parallel_tests:
+        raise SystemExit("--parallel-tests is not allowed with --mode bundle; run verification outside the read-only child review pass")
+    if target == "bundle":
+        assert target_ref
+        bundle_stats = enforce_bundle_content_preflight_limits(args, target_ref, include_generated=include_generated)
+    if not args.dry_run:
+        validate_reviewer_enforcement(args, reviewers)
+    if not args.dry_run:
+        validate_output_destinations(args, repo, target, target_ref)
+        protected = Path(target_ref).resolve() if target == "bundle" and target_ref else repo.resolve()
+        helper_temp = safe_mkdtemp("autoreview-helper.", protected)
+        args.helper_temp_dir = helper_temp
+        for reviewer in reviewers:
+            reviewer.helper_temp_dir = helper_temp
+    review_target_ref = target_ref
+    preserved_excluded: list[str] | None = None
+    if target == "bundle" and not args.dry_run:
+        assert target_ref
+        repo, review_target_ref, preserved_excluded = freeze_bundle_execution_root(target_ref, include_generated=include_generated)
+        bundle_stats = enforce_bundle_content_preflight_limits(args, review_target_ref, include_generated=include_generated)
+    command_reject_roots_list = [original_command_root, repo.resolve()]
+    if target == "bundle" and target_ref:
+        command_reject_roots_list.append(Path(target_ref).resolve())
+    command_reject_roots_value = tuple(dict.fromkeys(command_reject_roots_list))
+    args.command_reject_roots = command_reject_roots_value
+    for reviewer in reviewers:
+        reviewer.command_reject_roots = command_reject_roots_value
+    emit("workflow: helper")
+    emit(f"review_command: {format_command(sanitized_argv(sys.argv))}")
+    emit(f"autoreview target: {target}")
+    emit(f"branch: {branch}")
+    if len(reviewers) == 1 and not args.reviewers and not args.panel:
+        emit(f"engine: {reviewers[0].engine}")
+        if reviewers[0].model:
+            emit(f"model: {reviewers[0].model}")
+        if reviewers[0].thinking:
+            emit(f"thinking: {reviewers[0].thinking}")
+    else:
+        emit(f"reviewers: {', '.join(reviewer_label(reviewer) for reviewer in reviewers)}")
+    emit(f"tools: {'on' if args.tools else 'off'}")
+    emit(f"web_search: {'on' if args.web_search else 'off'}")
+    degraded_reasons = run_degraded_reasons(args, reviewers)
+    if degraded_reasons:
+        emit(f"degraded_helper_coverage: {'; '.join(degraded_reasons)}")
+    display_ref = args.commit if target == "commit" else target_ref
+    if target == "bundle":
+        emit(f"target_path: {target_ref}")
+        if review_target_ref != target_ref:
+            emit(f"frozen_target_path: {review_target_ref}")
+        emit(f"include_generated: {'on' if include_generated else 'off'}")
+        emit(f"exclude_generated: {'on' if args.exclude_generated else 'off'}")
+        if bundle_stats:
+            emit(
+                "bundle_preflight: "
+                f"files={bundle_stats['files']} directories={bundle_stats['directories']} "
+                f"bytes={bundle_stats['total_bytes']} excluded={bundle_stats['excluded']}"
+            )
+        if args.allow_large_bundle:
+            emit("bundle_preflight_limits: bypassed")
+    elif display_ref:
+        emit(f"ref: {display_ref}")
+
+    bundle, changed_paths, target_ref, line_counts, identity_material = build_review_bundle(
+        repo,
+        target,
+        review_target_ref,
+        args.commit,
+        include_generated=include_generated,
+        preserved_excluded=preserved_excluded,
+    )
+    target_identity = sha256_text(identity_material)
+    prompt = build_prompt(
+        repo,
+        target,
+        review_target_ref,
+        bundle,
+        load_extra_prompt(args),
+        load_datasets(args),
+        web_search=args.web_search,
+    )
+    if target == "bundle":
+        enforce_bundle_prompt_preflight_limit(args, prompt)
+    emit(f"bundle: {len(prompt)} chars")
+    emit(f"target_identity: sha256:{target_identity}")
+    if args.dry_run:
+        return 0
+
+    tests_monitor: ParallelTestsMonitor | None = None
+    if args.parallel_tests:
+        status_lines.append(f"tests: {command_summary(args.parallel_tests)}")
+        tests_monitor = start_parallel_tests(
+            args.parallel_tests,
+            repo,
+            args.parallel_tests_shell,
+            args.parallel_tests_timeout_seconds,
+        )
+    try:
+        if len(reviewers) == 1:
+            report = run_reviewer(reviewers[0], repo, prompt, changed_paths, args.require_finding, line_counts)
+            label = "autoreview degraded" if degraded_reasons else "autoreview"
+        else:
+            report = run_panel(args, reviewers, repo, prompt, changed_paths, line_counts)
+            panel_degraded_reasons = getattr(args, "panel_degraded_reasons", [])
+            combined_degraded_reasons = [*degraded_reasons, *panel_degraded_reasons]
+            label = "autoreview panel degraded" if combined_degraded_reasons else "autoreview panel"
+            if combined_degraded_reasons:
+                status_lines.append(f"degraded_panel_coverage: {'; '.join(combined_degraded_reasons)}")
+    finally:
+        tests_status = finish_parallel_tests(tests_monitor) if tests_monitor else 0
+    if target in {"branch", "commit"}:
+        enforce_clean_ref_review(repo, target)
+    status_lines.append(f"tests_status: {tests_status}")
+    has_findings = bool(report["findings"])
+    overall_incorrect = report["overall_correctness"] == "patch is incorrect"
+    status_failure = tests_status != 0 or (args.expect_findings and not has_findings)
+    if status_failure and not has_findings and report["overall_correctness"] == "patch is correct":
+        report["overall_correctness"] = "patch is incorrect"
+        report["overall_explanation"] = bounded_field(
+            f"{report['overall_explanation'].rstrip()}\n\nPost-review status failed before closeout: "
+            f"tests_status={tests_status}; expect_findings={'missing' if args.expect_findings and not has_findings else 'not requested'}.",
+            3000,
+        )
+
+    latest_bundle, _, _, _, latest_identity_material = build_review_bundle(
+        repo,
+        target,
+        review_target_ref,
+        args.commit,
+        include_generated=include_generated,
+        preserved_excluded=preserved_excluded,
+    )
+    latest_identity = sha256_text(latest_identity_material)
+    if latest_identity != target_identity:
+        raise SystemExit(
+            "stale review target: reviewed bundle changed before reporting "
+            f"(initial sha256:{target_identity}, current sha256:{latest_identity})"
+        )
+    emit(f"stale_guard: matched sha256:{latest_identity}")
+    for line in triage_status_lines(report):
+        emit(line)
+
+    if args.json_output:
+        resolved_output_path(args, "--json-output").write_text(json.dumps(report, indent=2) + "\n")
+
+    if args.output:
+        with resolved_output_path(args, "--output").open("w") as handle:
+            for line in status_lines:
+                print(line, file=handle)
+            print_report(report, label=label, file=handle)
+    print_report(report, label=label)
+
+    if tests_status != 0:
+        return 1
+    if args.expect_findings:
+        return 0 if has_findings else 1
+    return 1 if has_findings or overall_incorrect else 0
+
+
+class Tee:
+    def __init__(self, *streams: Any) -> None:
+        self.streams = streams
+
+    def write(self, data: str) -> None:
+        for stream in self.streams:
+            stream.write(data)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Super Review Council / 超级审查会"
+  short_description: "Heavy multi-agent review workflow."
+  default_prompt: "Use $super-review-council to run a heavy multi-agent review council."
+
+policy:
+  allow_implicit_invocation: false

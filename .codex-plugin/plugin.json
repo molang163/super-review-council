@@ -1,0 +1,37 @@
+{
+  "name": "super-review-council",
+  "version": "0.1.0",
+  "description": "Heavy multi-agent review council workflow for Codex.",
+  "author": {
+    "name": "molang163",
+    "url": "https://github.com/molang163"
+  },
+  "homepage": "https://github.com/molang163/super-review-council",
+  "repository": "https://github.com/molang163/super-review-council",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "skill",
+    "review",
+    "multi-agent",
+    "verification"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Super Review Council / 超级审查会",
+    "shortDescription": "Heavy multi-agent review workflow.",
+    "longDescription": "Super Review Council is a heavy review workflow for Codex. It coordinates multiple AI reviewers through review, triage, fixing, verification, and repeat loops, with strict target freezing and drift checks.",
+    "developerName": "molang163",
+    "category": "Productivity",
+    "capabilities": [
+      "Review",
+      "Multi-agent",
+      "Verification"
+    ],
+    "defaultPrompt": [
+      "Use $super-review-council to review this change.",
+      "用 $super-review-council 跑一次超级审查会。"
+    ],
+    "brandColor": "#2563EB"
+  }
+}

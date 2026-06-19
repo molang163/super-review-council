@@ -1,0 +1,10 @@
+Super Review Council is a derivative of the autoreview skill from:
+
+https://github.com/openclaw/agent-skills/tree/main/skills/autoreview
+
+Original license: MIT
+Original copyright: Copyright (c) 2026 openclaw
+
+This derivative renames the public skill to Super Review Council / 超级审查会
+and adapts the workflow toward an explicit heavy multi-agent review council
+with stricter freezing, triage, verification, helper-trust, and privacy rules.
