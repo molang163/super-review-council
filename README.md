@@ -17,6 +17,8 @@ mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
 cp -R skills/super-review-council "${CODEX_HOME:-$HOME/.codex}/skills/"
 ```
 
+如果你用的是原生 Windows PowerShell，请看下面“安装”里的 PowerShell 命令。
+
 重启或重新加载 Codex 后，明确调用：
 
 ```text
@@ -55,15 +57,26 @@ $super-review-council
 
 ### 安装
 
-前提：你需要有支持 skill 的 Codex，以及 `git`。
+前提：你需要有支持 skill 的 Codex、`git`，以及 Python 3。helper 和测试 harness 都需要 Python 3。
 
-本地 skill 安装：
+macOS/Linux/Git Bash：
 
 ```bash
 git clone https://github.com/molang163/super-review-council.git
 cd super-review-council
 mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
 cp -R skills/super-review-council "${CODEX_HOME:-$HOME/.codex}/skills/"
+```
+
+原生 Windows PowerShell：
+
+```powershell
+git clone https://github.com/molang163/super-review-council.git
+Set-Location super-review-council
+$CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
+$SkillsDir = Join-Path $CodexHome "skills"
+New-Item -ItemType Directory -Force -Path $SkillsDir | Out-Null
+Copy-Item -Recurse -Force .\skills\super-review-council $SkillsDir
 ```
 
 如果没有设置 `CODEX_HOME`，复制后的目录通常是：
@@ -75,6 +88,12 @@ cp -R skills/super-review-council "${CODEX_HOME:-$HOME/.codex}/skills/"
 这个仓库也带有 `.codex-plugin/plugin.json`。如果你的 Codex 版本支持从仓库安装 plugin，可以按你当前 Codex 的 plugin 安装流程使用它。
 
 ### 验证
+
+先确认 Python 3 可用：
+
+```bash
+python3 --version
+```
 
 确认 skill 文件存在：
 
@@ -94,6 +113,26 @@ sed -n '1,12p' "${CODEX_HOME:-$HOME/.codex}/skills/super-review-council/SKILL.md
 "${CODEX_HOME:-$HOME/.codex}/skills/super-review-council/scripts/autoreview" --help
 ```
 
+运行离线 smoke 验证。它不会调用真实审查 engine，会使用临时目录跑 deterministic helper 检查：
+
+```bash
+"${CODEX_HOME:-$HOME/.codex}/skills/super-review-council/scripts/test-review-harness" --offline
+```
+
+原生 Windows PowerShell：
+
+```powershell
+py -3 --version
+$CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
+$SkillDir = Join-Path $CodexHome "skills\super-review-council"
+Test-Path (Join-Path $SkillDir "SKILL.md")
+Get-Content (Join-Path $SkillDir "SKILL.md") -TotalCount 12
+py -3 (Join-Path $SkillDir "scripts\autoreview") --help
+& (Join-Path $SkillDir "scripts\test-review-harness.ps1") -Offline
+```
+
+如果你的 Windows 环境没有 `py` 启动器，但 `python` 指向 Python 3，可以把上面的 `py -3` 换成 `python`。
+
 ### 仓库结构
 
 ```text
@@ -101,17 +140,23 @@ sed -n '1,12p' "${CODEX_HOME:-$HOME/.codex}/skills/super-review-council/SKILL.md
 ├── .codex-plugin/plugin.json
 ├── skills/
 │   └── super-review-council/
+│       ├── agents/
+│       │   └── openai.yaml
 │       ├── SKILL.md
 │       ├── LICENSE
 │       ├── NOTICE
 │       └── scripts/
-│           └── autoreview
+│           ├── autoreview
+│           ├── test-review-harness
+│           ├── test-review-harness.py
+│           └── test-review-harness.ps1
 ├── LICENSE
 ├── NOTICE
 └── README.md
 ```
 
 `SKILL.md` 是 Codex 真正读取的 skill 指令。README 只是给人看的安装和项目说明。
+`agents/openai.yaml` 是 agent/plugin 界面元数据。`scripts/test-review-harness*` 是随仓库发布的 smoke/acceptance 验证工具。
 
 ### 兼容说明
 
@@ -141,6 +186,8 @@ cd super-review-council
 mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
 cp -R skills/super-review-council "${CODEX_HOME:-$HOME/.codex}/skills/"
 ```
+
+For native Windows PowerShell, use the PowerShell commands in the Install section below.
 
 Restart or reload Codex, then invoke the skill explicitly:
 
@@ -180,15 +227,26 @@ Do not use it for:
 
 ### Install
 
-Prerequisites: Codex with skill support, plus `git`.
+Prerequisites: Codex with skill support, `git`, and Python 3. The helper and test harness both require Python 3.
 
-Install as a local skill:
+macOS/Linux/Git Bash:
 
 ```bash
 git clone https://github.com/molang163/super-review-council.git
 cd super-review-council
 mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
 cp -R skills/super-review-council "${CODEX_HOME:-$HOME/.codex}/skills/"
+```
+
+Native Windows PowerShell:
+
+```powershell
+git clone https://github.com/molang163/super-review-council.git
+Set-Location super-review-council
+$CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
+$SkillsDir = Join-Path $CodexHome "skills"
+New-Item -ItemType Directory -Force -Path $SkillsDir | Out-Null
+Copy-Item -Recurse -Force .\skills\super-review-council $SkillsDir
 ```
 
 If `CODEX_HOME` is not set, the copied skill usually ends up here:
@@ -200,6 +258,12 @@ If `CODEX_HOME` is not set, the copied skill usually ends up here:
 This repository also includes `.codex-plugin/plugin.json`. If your Codex build supports installing plugins from repositories, use your current Codex plugin installation flow.
 
 ### Verify
+
+First check that Python 3 is available:
+
+```bash
+python3 --version
+```
 
 Check that the skill file exists:
 
@@ -219,6 +283,26 @@ Check the helper:
 "${CODEX_HOME:-$HOME/.codex}/skills/super-review-council/scripts/autoreview" --help
 ```
 
+Run the offline smoke validation. It does not call live review engines; it uses a temporary directory and the deterministic helper checks:
+
+```bash
+"${CODEX_HOME:-$HOME/.codex}/skills/super-review-council/scripts/test-review-harness" --offline
+```
+
+Native Windows PowerShell:
+
+```powershell
+py -3 --version
+$CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
+$SkillDir = Join-Path $CodexHome "skills\super-review-council"
+Test-Path (Join-Path $SkillDir "SKILL.md")
+Get-Content (Join-Path $SkillDir "SKILL.md") -TotalCount 12
+py -3 (Join-Path $SkillDir "scripts\autoreview") --help
+& (Join-Path $SkillDir "scripts\test-review-harness.ps1") -Offline
+```
+
+If your Windows environment does not have the `py` launcher but `python` points to Python 3, replace `py -3` with `python`.
+
 ### Repository Layout
 
 ```text
@@ -226,17 +310,23 @@ Check the helper:
 ├── .codex-plugin/plugin.json
 ├── skills/
 │   └── super-review-council/
+│       ├── agents/
+│       │   └── openai.yaml
 │       ├── SKILL.md
 │       ├── LICENSE
 │       ├── NOTICE
 │       └── scripts/
-│           └── autoreview
+│           ├── autoreview
+│           ├── test-review-harness
+│           ├── test-review-harness.py
+│           └── test-review-harness.ps1
 ├── LICENSE
 ├── NOTICE
 └── README.md
 ```
 
 `SKILL.md` is the instruction file Codex actually loads. This README is for humans who need installation and project context.
+`agents/openai.yaml` contains agent/plugin interface metadata. `scripts/test-review-harness*` are the shipped smoke/acceptance validation tools.
 
 ### Compatibility
 
