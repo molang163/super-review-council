@@ -341,7 +341,7 @@ def assert_bundle_dry_run(script_dir: Path, root: Path, target: Path) -> None:
     for expected in (
         "workflow: helper",
         "autoreview target: bundle",
-        f"target_path: {target}",
+        f"target_path: {target.resolve()}",
         "include_generated: off",
         "exclude_generated: on",
         "target_identity: sha256:",
@@ -543,6 +543,8 @@ def assert_positive_int_option_parsing(script_dir: Path, root: Path, target: Pat
 
 
 def shell_command(args: list[str]) -> str:
+    if os.name == "nt":
+        return subprocess.list2cmdline(args)
     return " ".join(shlex.quote(arg) for arg in args)
 
 
