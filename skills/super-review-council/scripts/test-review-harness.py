@@ -373,6 +373,64 @@ def assert_bundle_target_failures(script_dir: Path, root: Path) -> None:
         "archive bundle targets are not expanded",
         "archive bundle target rejected",
     )
+    binary = root / "opaque.bin"
+    binary.write_bytes(b"prefix\x00\x01\x02binary payload\x00suffix")
+    expect_helper_failure(
+        script_dir,
+        root,
+        ["--mode", "bundle", "--target", str(binary), "--dry-run"],
+        "single-file binary bundle targets are opaque",
+        "binary single-file bundle target rejected",
+    )
+
+
+def assert_bundle_symlink_rejection(script_dir: Path, root: Path) -> None:
+    if not hasattr(os, "symlink"):
+        print("ok: bundle symlink rejection (skipped: no os.symlink)", flush=True)
+        return
+    target = root / "symlink-bundle-target"
+    write_text(target / "app.js", "export const reviewed = true;\n")
+    link = target / "linked.js"
+    try:
+        os.symlink(target / "app.js", link)
+    except (OSError, NotImplementedError):
+        print("ok: bundle symlink rejection (skipped: symlink unsupported)", flush=True)
+        return
+    expect_helper_failure(
+        script_dir,
+        root,
+        ["--mode", "bundle", "--target", str(target), "--dry-run"],
+        "bundle target contains symlink",
+        "bundle target with symlink rejected",
+    )
+
+
+def assert_bundle_freeze_read_only_subdir(script_dir: Path, root: Path) -> None:
+    target = root / "readonly-subdir-bundle-target"
+    write_text(target / "app.js", "export const reviewed = true;\n")
+    readonly_dir = target / "vendored"
+    write_text(readonly_dir / "lib.js", "export const vendored = true;\n")
+    fake_claude = create_fake_claude(root)
+    os.chmod(readonly_dir, 0o555)
+    try:
+        expect_helper_success(
+            script_dir,
+            root,
+            [
+                "--mode",
+                "bundle",
+                "--target",
+                str(target),
+                "--engine",
+                "claude",
+                "--claude-bin",
+                str(fake_claude),
+                "--no-tools",
+            ],
+            "bundle freeze tolerates read-only source subdir",
+        )
+    finally:
+        os.chmod(readonly_dir, 0o755)
 
 
 def assert_bundle_limit_enforcement(script_dir: Path, root: Path, target: Path) -> None:
@@ -601,6 +659,8 @@ def run_offline_checks(script_dir: Path) -> None:
         assert_manifest_handling(script_dir, target)
         assert_bundle_dry_run(script_dir, root, target)
         assert_bundle_target_failures(script_dir, root)
+        assert_bundle_symlink_rejection(script_dir, root)
+        assert_bundle_freeze_read_only_subdir(script_dir, root)
         assert_output_destination_blocking(script_dir, root, target)
         assert_bundle_limit_enforcement(script_dir, root, target)
         assert_positive_int_option_parsing(script_dir, root, target)
