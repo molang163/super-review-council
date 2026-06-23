@@ -2522,7 +2522,6 @@ def freeze_bundle_execution_root(target_ref: str, *, include_generated: bool) ->
         rel = directory.relative_to(target_path)
         destination = execution_root / rel
         destination.mkdir(parents=True, exist_ok=True)
-        os.chmod(destination, stat.S_IMODE(directory.stat().st_mode))
     for path in files:
         stats = ancestor_stats(path, target_path)
         rel = path.relative_to(target_path)
